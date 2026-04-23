@@ -1,0 +1,1 @@
+docker buildx build -f ./Dockerfile_sglang_diffusion . -t artifacts.iflytek.com/docker-private/atp/video_sglang_openai:v0.0.1-dev

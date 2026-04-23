@@ -1,0 +1,13 @@
+{
+    "modelName": "wan2.2-i2v-14b",
+    "modelTaskType": "i2v",
+    "sglStorageType": "s3",
+    "sglS3EndpointURL": "",
+    "sglS3BucketName": "",
+    "sglS3SecretKey": "",
+    "sglS3AccessKey": "",
+    "pollIntervalMs": "5000",
+    "supportedResolutions": {
+        "wan2.2-i2v-14b": ["480P", "720P"]
+    }
+}
