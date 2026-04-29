@@ -11,17 +11,18 @@ RUN pip install aiges==0.16.1 \
     --extra-index-url https://pypi.mirrors.ustc.edu.cn/simple/
 
 # 添加 aiges 的配置
-ADD aiservice_2.9.11.5.bin-sa /home/aiges/
-COPY ./log.py /usr/local/lib/python3.11/site-packages/aiges/utils/
+COPY ./docker/log.py /usr/local/lib/python3.11/site-packages/aiges/utils/
+COPY ./docker/aiservice_2.9.11.5.bin-sa/ /home/aiges/
 
 # 安装本地 sglang（可选你是否需要 --no-deps 或开发模式） 安装 nc
-RUN apt-get update && apt-get install -y --no-install-recommends netcat \
+RUN apt-get update && apt-get install -y --no-install-recommends netcat curl \
     && rm -rf /var/lib/apt/lists/* \
-    && pip install uv poetry \
+    && pip install uv poetry boto3 \
     && uv pip install "sglang[diffusion]" --prerelease=allow --system
 
 COPY . /build/sglang_diffusion_sdk
 RUN cd /build/sglang_diffusion_sdk && make build
 
+WORKDIR /home/aiges
 # 清除缓存
 RUN rm -rf ~/.cache/pip
