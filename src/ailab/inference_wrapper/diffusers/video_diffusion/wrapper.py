@@ -148,8 +148,12 @@ class RequestInfo:
         self.requests = []
         self.raw_req_chunks = []        # raw_req 分片缓存
         self.raw_req = None             # 解析后的 raw_req dict
-        self.stop_q = queue.Queue()
-        self.out_q = queue.Queue()
+        self.stop_event = threading.Event()  # 取消信号（替代 stop_q + cancelled）
+        self.finished_event = threading.Event()  # 任务已进入终态
+        self.end_sent_event = threading.Event()  # 已发送 DataEnd（防止重复）
+        self._end_sent_lock = threading.Lock()  # _send_end_response 原子化锁
+        self.out_q = queue.Queue(maxsize=10)  # 有限大小，防止内存膨胀
+        self._destroy_pending = False  # wrapperDestroy 已调用，待清理
         self.task_status = "idle"  # idle / queued / processing / completed / failed
 
 class PromptInferenceInfo:
@@ -331,8 +335,8 @@ class Wrapper(WrapperBase):
                 raw_req_status = raw_req_node.status
 
                 # 缓存本次收到的 raw_req 分片
-                with self.request_map_lock:
-                    requestInfo.raw_req_chunks.append(raw_req_data)
+                # aiges 框架保证同一 handle 的 wrapperWrite 串行调用，无需加锁
+                requestInfo.raw_req_chunks.append(raw_req_data)
 
                 # raw_req 尚未传输完毕，仅缓存
                 if raw_req_status != DataEnd:
@@ -342,15 +346,16 @@ class Wrapper(WrapperBase):
                     return 0
 
                 # DataEnd: raw_req 传输完毕，拼合并解析 JSON
-                with self.request_map_lock:
-                    raw_req_bytes = b''.join(requestInfo.raw_req_chunks)
-                    requestInfo.raw_req_chunks.clear()
+                raw_req_bytes = b''.join(requestInfo.raw_req_chunks)
+                requestInfo.raw_req_chunks.clear()
                 try:
                     raw_req_str = raw_req_bytes.decode("utf-8")
                     requestInfo.raw_req = json.loads(raw_req_str)
                     self.filelogger.info(f"raw_req parsed successfully, handle: {handle}")
                 except Exception as e:
                     self.filelogger.error(f"Failed to parse raw_req JSON: {e}")
+                    requestInfo.finished_event.set()
+                    requestInfo.task_status = "failed"
                     return -1
             else:
                 # 非 raw_req 帧，跳过（数据尚未到达）
@@ -360,15 +365,18 @@ class Wrapper(WrapperBase):
             prompt = requestInfo.raw_req.get("prompt")
             if not prompt:
                 self.filelogger.error("prompt is required in raw_req")
+                requestInfo.finished_event.set()
+                requestInfo.task_status = "failed"
                 return -1
 
             thread_id = self.thread_pool.alloc_min_thread()
             inferenceInfo = PromptInferenceInfo(self, thread_id, RequestMode.STREAM, prompt, requestInfo)
 
+            # 先修改 requestInfo 内部字段，再投递任务（保证可见性）
+            requestInfo.handle = handle
+            requestInfo.requests.append(inferenceInfo.request_id)
+
             self.thread_pool.put_task(thread_id, inferenceInfo)
-            with self.request_map_lock:
-                requestInfo.handle = handle
-                requestInfo.requests.append(inferenceInfo.request_id)
 
             self.filelogger.debug(
                 f"success wrapperWrite handle:{handle}, thread_id:{thread_id},request_id:{inferenceInfo.request_id}")
@@ -393,18 +401,35 @@ class Wrapper(WrapperBase):
             r = r.response_err(ERROR_INVALID_PARAMS)
             return r
 
+        # 检查是否已取消（wrapperDestroy 已调用）
+        if requestInfo.stop_event.is_set() and not requestInfo.end_sent_event.is_set():
+            # 发送 cancelled DataEnd 兜底
+            self._send_end_response(requestInfo, {"status": "cancelled", "error": "Session destroyed"})
+
         # 非阻塞读取: 逐条取出 out_q 中的结果
         try:
             rs = requestInfo.out_q.get_nowait()
         except queue.Empty:
-            # 无结果, 返回当前任务运行状态
-            status_resp = Response()
-            video_info = {
-                "status": requestInfo.task_status
-            }
-            content = resp_content(DataContinue, video_info)
-            status_resp.list = [content]
-            return status_resp
+            # 检查是否已进入终态（兜底：worker 已完成但 out_q 中无 DataEnd）
+            if requestInfo.finished_event.is_set():
+                self._send_end_response(requestInfo, {"status": requestInfo.task_status})
+                try:
+                    rs = requestInfo.out_q.get_nowait()
+                except queue.Empty:
+                    # 极端情况：end_sent 已设但 out_q 仍空
+                    status_resp = Response()
+                    content = resp_content(DataEnd, {"status": requestInfo.task_status})
+                    status_resp.list = [content]
+                    return status_resp
+            else:
+                # 无结果, 返回当前任务运行状态
+                status_resp = Response()
+                video_info = {
+                    "status": requestInfo.task_status
+                }
+                content = resp_content(DataContinue, video_info)
+                status_resp.list = [content]
+                return status_resp
 
         if not isinstance(rs, Response):
             self.filelogger.error(f"wrapperRead invalid response type: {type(rs)}")
@@ -412,10 +437,12 @@ class Wrapper(WrapperBase):
             r = r.response_err(ERROR_DOWNSTREAM_FAILED)
             return r
 
-        # DataEnd 表示本次会话结果读取完毕
+        # DataEnd 表示本次会话结果读取完毕，清理 request_map
         is_end = any(rd.status == DataEnd for rd in rs.list) if rs.list else False
         if is_end:
             self.filelogger.info(f"wrapperRead session done, handle: {handle}")
+            with self.request_map_lock:
+                self.request_map.pop(handle, None)
 
         return rs
 
@@ -425,8 +452,13 @@ class Wrapper(WrapperBase):
             ri = self.request_map.get(handle)
             if ri is None:
                 return -1
-            ri.stop_q.put(True, block=False)
-            del self.request_map[handle]
+            # 软取消：通知 worker 停止
+            ri.stop_event.set()
+            ri._destroy_pending = True
+            # 如果 worker 已完成，直接删除；否则保留给 wrapperRead 兜底
+            if ri.finished_event.is_set():
+                del self.request_map[handle]
+                self.filelogger.info(f"wrapperDestroy, worker already finished, handle: {handle}")
         self.filelogger.info(f"success wrapperDestroy, handle: {handle}")
         return 0
 
@@ -444,9 +476,44 @@ class Wrapper(WrapperBase):
         return res
 
     def _send_response(self, res: Response, requestInfo: RequestInfo):
-        """推送到 out_q 供 wrapperRead 同步读取"""
-        requestInfo.out_q.put(res)
-        # callback(res, requestInfo.user_tag)
+        """推送到 out_q 供 wrapperRead 同步读取，队列满时丢弃旧进度数据"""
+        try:
+            requestInfo.out_q.put_nowait(res)
+        except queue.Full:
+            # 队列满：丢弃最旧的 DataContinue 进度数据，保留 DataBegin/DataEnd
+            for _ in range(requestInfo.out_q.qsize() + 1):
+                try:
+                    old = requestInfo.out_q.get_nowait()
+                    # 如果是终态数据，重新放回
+                    if isinstance(old, Response) and old.list and any(rd.status == DataEnd for rd in old.list):
+                        requestInfo.out_q.put_nowait(old)
+                except queue.Empty:
+                    break
+            try:
+                requestInfo.out_q.put_nowait(res)
+            except queue.Full:
+                self.filelogger.warning(f"out_q still full after drain, dropping response for handle: {requestInfo.handle}")
+
+    def _send_end_response(self, requestInfo: RequestInfo, video_info: dict):
+        """发送 DataEnd 终态响应，保证只发一次（原子化 check-and-set）"""
+        # end_sent_event 初始为 False，set() 返回 True 表示由本线程设置
+        # 如果已经是 True，说明其他线程已发送过，直接返回
+        if not requestInfo._end_sent_lock.acquire(blocking=False):
+            # 另一个线程正在发送，等待其完成后返回
+            requestInfo._end_sent_lock.acquire()
+            requestInfo._end_sent_lock.release()
+            return
+        try:
+            if requestInfo.end_sent_event.is_set():
+                return
+            requestInfo.end_sent_event.set()
+            requestInfo.finished_event.set()
+            res = Response()
+            content = resp_content(DataEnd, video_info)
+            res.list = [content]
+            self._send_response(res, requestInfo)
+        finally:
+            requestInfo._end_sent_lock.release()
 
     async def create_video_task(self, inferenceInfo: PromptInferenceInfo):
         requestInfo = inferenceInfo.requestInfo
@@ -454,132 +521,142 @@ class Wrapper(WrapperBase):
         user_tag = requestInfo.user_tag
         sid = requestInfo.sid
 
-        # 检查是否已停止
-        is_stoped = False
-        if not requestInfo.stop_q.empty():
-            is_stoped = requestInfo.stop_q.get_nowait()
-        if is_stoped:
-            res = self._response_err(ERROR_DOWNSTREAM_FAILED, "Task aborted")
-            self._send_response(res, requestInfo)
-            self.filelogger.info(f"====>inference abort before infer, {request_id}")
-            return
-
-        raw_req = requestInfo.raw_req
-        prompt = inferenceInfo.prompt
-
-        # 从 raw_req 解析各字段
-        size = raw_req.get("size", "1280x720")
-        negative_prompt = raw_req.get("negative_prompt") or None
-        reference_url = raw_req.get("reference_url") or None
-        # 规范化 reference_url：支持 http(s) 链接 和 base64 数据
-        if reference_url:
-            reference_url = _normalize_reference_url(reference_url, self.filelogger)
-        seed = raw_req.get("seed")
-        if seed is not None and seed != "":
-            seed = int(seed)
-        else:
-            seed = None
-        num_inference_steps = raw_req.get("num_inference_steps")
-        if num_inference_steps:
-            num_inference_steps = int(num_inference_steps)
-        guidance_scale = raw_req.get("guidance_scale")
-        if guidance_scale is not None and guidance_scale != "":
-            guidance_scale = float(guidance_scale)
-        else:
-            guidance_scale = None
-        seconds = raw_req.get("seconds")
-        if seconds is not None and seconds != "":
-            seconds = int(seconds)
-        else:
-            seconds = None
-        fps = raw_req.get("fps")
-        if fps is not None and fps != "":
-            fps = int(fps)
-        else:
-            fps = None
-
-        # 校验尺寸
-        supported_sizes = set()
-        for res in self.supported_resolutions[self.model_name]:
-            supported_sizes.update(RESOLUTIONS_TOSIZE[res])
-
-        if size not in supported_sizes:
-            ori_size = size
-            size = "1280x720" if self.model_name not in ["wan2.1-t2v-1.3b"] else "832x480"
-            self.filelogger.warning(f"{self.model_name} unsupported size {ori_size}, use {size} instead.")
-
-        self.filelogger.info(f"Creating video generation task, prompt: {prompt[:100]}...")
-        requestInfo.task_status = "queued"
         try:
-            req_params = {
-                "model": self.model_name,
-                "prompt": prompt,
-                "size": size,
-            }
-
-            extra_body = {}
-            if negative_prompt:
-                extra_body["negative_prompt"] = negative_prompt
-            if seed is not None:
-                extra_body["seed"] = seed
-            if num_inference_steps:
-                extra_body["num_inference_steps"] = num_inference_steps
-            if guidance_scale is not None:
-                extra_body["guidance_scale"] = guidance_scale
-            if fps is not None:
-                extra_body["fps"] = fps
-
-            if seconds is not None:
-                req_params["seconds"] = seconds
-            req_params["extra_body"] = extra_body
-
-            # I2V 需要传入图片
-            if self.task_type == "i2v":
-                if not reference_url:
-                    self.filelogger.error("i2v task requires reference_url in raw_req")
-                    res = self._response_err(ERROR_IMAGE_READ_FAILED, "i2v task requires reference_url in raw_req")
-                    self._send_response(res, requestInfo)
-                    return
-                extra_body["reference_url"] = reference_url
-
-            self.filelogger.debug(f"video task params: {str(req_params)[:1000]}")
-            rsp = await asyncio.to_thread(self.client.videos.create, **req_params)
-
-            if rsp.status == "failed":
-                self.filelogger.error(
-                    f"Failed to create task, ase_sid:{sid}, ase_request_id:{request_id}, request_id:{rsp.id}."
-                )
-                res = self._response_err(ERROR_DOWNSTREAM_FAILED, "Failed to create video task")
-                self._send_response(res, requestInfo)
+            # 检查是否已取消
+            if requestInfo.stop_event.is_set():
+                self.filelogger.info(f"====>inference abort before infer, {request_id}")
+                requestInfo.task_status = "failed"
+                self._send_end_response(requestInfo, {"status": "failed", "error": "Task aborted"})
                 return
 
-            task_id = rsp.id
-            requestInfo.task_status = rsp.status
-            self.filelogger.info(f"Video task created, task_id: {task_id}")
+            raw_req = requestInfo.raw_req
+            prompt = inferenceInfo.prompt
 
-            # 发送 DataBegin 状态
-            res_begin = Response()
-            video_info = {"request_id": request_id}
-            video_info.update(rsp.model_dump())
-            content = resp_content(DataBegin, video_info)
-            res_begin.list = [content]
-            self._send_response(res_begin, requestInfo)
+            # 从 raw_req 解析各字段
+            size = raw_req.get("size", "1280x720")
+            negative_prompt = raw_req.get("negative_prompt") or None
+            reference_url = raw_req.get("reference_url") or None
+            # 规范化 reference_url：支持 http(s) 链接 和 base64 数据
+            if reference_url:
+                reference_url = _normalize_reference_url(reference_url, self.filelogger)
+            seed = raw_req.get("seed")
+            if seed is not None and seed != "":
+                seed = int(seed)
+            else:
+                seed = None
+            num_inference_steps = raw_req.get("num_inference_steps")
+            if num_inference_steps:
+                num_inference_steps = int(num_inference_steps)
+            guidance_scale = raw_req.get("guidance_scale")
+            if guidance_scale is not None and guidance_scale != "":
+                guidance_scale = float(guidance_scale)
+            else:
+                guidance_scale = None
+            seconds = raw_req.get("seconds")
+            if seconds is not None and seconds != "":
+                seconds = int(seconds)
+            else:
+                seconds = None
+            fps = raw_req.get("fps")
+            if fps is not None and fps != "":
+                fps = int(fps)
+            else:
+                fps = None
 
-            # 轮询获取结果
-            res = await self.poll_video_task_async(task_id, sid, request_id, requestInfo)
-            if res:
-                self._send_response(res, requestInfo)
+            # 校验尺寸
+            supported_sizes = set()
+            for res in self.supported_resolutions[self.model_name]:
+                supported_sizes.update(RESOLUTIONS_TOSIZE[res])
+
+            if size not in supported_sizes:
+                ori_size = size
+                size = "1280x720" if self.model_name not in ["wan2.1-t2v-1.3b"] else "832x480"
+                self.filelogger.warning(f"{self.model_name} unsupported size {ori_size}, use {size} instead.")
+
+            self.filelogger.info(f"Creating video generation task, prompt: {prompt[:100]}...")
+            requestInfo.task_status = "queued"
+            try:
+                req_params = {
+                    "model": self.model_name,
+                    "prompt": prompt,
+                    "size": size,
+                }
+
+                extra_body = {}
+                if negative_prompt:
+                    extra_body["negative_prompt"] = negative_prompt
+                if seed is not None:
+                    extra_body["seed"] = seed
+                if num_inference_steps:
+                    extra_body["num_inference_steps"] = num_inference_steps
+                if guidance_scale is not None:
+                    extra_body["guidance_scale"] = guidance_scale
+                if fps is not None:
+                    extra_body["fps"] = fps
+
+                if seconds is not None:
+                    req_params["seconds"] = seconds
+                req_params["extra_body"] = extra_body
+
+                # I2V 需要传入图片
+                if self.task_type == "i2v":
+                    if not reference_url:
+                        self.filelogger.error("i2v task requires reference_url in raw_req")
+                        requestInfo.task_status = "failed"
+                        self._send_end_response(requestInfo, {"status": "failed", "error": "i2v task requires reference_url in raw_req"})
+                        return
+                    extra_body["reference_url"] = reference_url
+
+                # 再次检查取消
+                if requestInfo.stop_event.is_set():
+                    self.filelogger.info(f"Task cancelled before API call, {request_id}")
+                    requestInfo.task_status = "failed"
+                    self._send_end_response(requestInfo, {"status": "failed", "error": "Task cancelled"})
+                    return
+
+                self.filelogger.debug(f"video task params: {str(req_params)[:1000]}")
+                rsp = await asyncio.to_thread(self.client.videos.create, **req_params)
+
+                if rsp.status == "failed":
+                    self.filelogger.error(
+                        f"Failed to create task, ase_sid:{sid}, ase_request_id:{request_id}, request_id:{rsp.id}."
+                    )
+                    requestInfo.task_status = "failed"
+                    self._send_end_response(requestInfo, {"status": "failed", "error": "Failed to create video task"})
+                    return
+
+                task_id = rsp.id
+                requestInfo.task_status = rsp.status
+                self.filelogger.info(f"Video task created, task_id: {task_id}")
+
+                # 发送 DataBegin 状态
+                res_begin = Response()
+                video_info = {"request_id": request_id}
+                video_info.update(rsp.model_dump())
+                content = resp_content(DataBegin, video_info)
+                res_begin.list = [content]
+                self._send_response(res_begin, requestInfo)
+
+                # 轮询获取结果（终态已由 poll 内部通过 _send_end_response 发送）
+                await self.poll_video_task_async(task_id, sid, request_id, requestInfo)
+
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                self.filelogger.error(f"An error occurred when infer: {e}, ret {ERROR_DOWNSTREAM_FAILED}")
+                requestInfo.task_status = "failed"
+                self._send_end_response(requestInfo, {"status": "failed", "error": str(e)})
 
         except Exception as e:
-            import traceback
-            traceback.print_exc()
-            self.filelogger.error(f"An error occurred when infer: {e}, ret {ERROR_DOWNSTREAM_FAILED}")
-            res = self._response_err(ERROR_DOWNSTREAM_FAILED, str(e))
-            self._send_response(res, requestInfo)
+            # 外层兜底：任何未预期的异常
+            self.filelogger.error(f"Unexpected error in create_video_task: {e}")
+            requestInfo.task_status = "failed"
+            self._send_end_response(requestInfo, {"status": "failed", "error": f"Unexpected error: {e}"})
 
     async def poll_video_task_async(self, task_id: str, sid: str, request_id: str, requestInfo: RequestInfo) -> Response:
         """
         异步轮询视频任务状态，直到完成或超时
+        注意：此函数返回的 Response 由调用方(_send_response)发送，终态 DataEnd 由 _send_end_response 统一处理
         """
         self.filelogger.info(f"Waiting video task result, task_id: {task_id}")
 
@@ -589,11 +666,19 @@ class Wrapper(WrapperBase):
 
         last_status = None
         while True:
+            # 检查取消
+            if requestInfo.stop_event.is_set():
+                self.filelogger.info(f"Task cancelled during poll, task_id: {task_id}")
+                requestInfo.task_status = "failed"
+                self._send_end_response(requestInfo, {"status": "failed", "error": "Task cancelled"})
+                return None  # 已由 _send_end_response 发送终态
+
             # 检查超时
             if time.time() > deadline:
                 self.filelogger.error(f"Poll timeout for task_id: {task_id}")
-                res = self._response_err(ERROR_POLL_TIMEOUT, f"Poll timeout after {poll_timeout_s}s")
-                return res
+                requestInfo.task_status = "failed"
+                self._send_end_response(requestInfo, {"status": "failed", "error": f"Poll timeout after {poll_timeout_s}s"})
+                return None
 
             try:
                 rsp = await asyncio.to_thread(self.client.videos.retrieve, video_id=task_id)
@@ -613,17 +698,15 @@ class Wrapper(WrapperBase):
                     video_info = {"request_id": request_id}
                     video_info.update(rsp.model_dump())
 
-                    res = Response()
-                    content = resp_content(DataEnd, video_info)
-                    res.list = [content]
-                    return res
+                    self._send_end_response(requestInfo, video_info)
+                    return None  # 已由 _send_end_response 发送终态
 
                 elif current_status == "failed":
                     requestInfo.task_status = "failed"
                     error_msg = getattr(rsp, 'error', None) or "unknown"
                     self.filelogger.error(f"Video task failed, task_id: {task_id}, error: {error_msg}")
-                    res = self._response_err(ERROR_DOWNSTREAM_FAILED, f"Video generation failed: {error_msg}")
-                    return res
+                    self._send_end_response(requestInfo, {"status": "failed", "error": f"Video generation failed: {error_msg}"})
+                    return None
 
                 else:
                     # 发送进度更新 DataContinue
@@ -639,8 +722,6 @@ class Wrapper(WrapperBase):
                 self.filelogger.error(f"Error polling task {task_id}: {e}")
 
             await asyncio.sleep(poll_interval_ms / 1000.0)
-
-        return None  # unreachable, but for type safety
 
 
     def wrapperFini(self) -> int:
