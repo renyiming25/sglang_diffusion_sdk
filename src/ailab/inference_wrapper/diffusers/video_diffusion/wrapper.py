@@ -8,16 +8,13 @@ import asyncio
 import queue
 import enum
 import uuid
-import base64
-import io
 import subprocess
 import socket
 import time
 import requests
 
-from PIL import Image
-from typing import List, Dict
-from openai import OpenAI, AsyncOpenAI
+from typing import Dict
+from openai import OpenAI
 
 from aiges.core.types import *
 try:
@@ -114,69 +111,28 @@ def _setup_health_status_probe(port: int, filelogger) -> None:
     threading.Thread(target=run, daemon=True).start()
 
 
-def get_payload_text(reqData: DataListCls, filelogger):
-    try:
-        text = reqData.get("video_description").data.decode("utf-8")
-        return text
-    except Exception as e:
-        filelogger.warn(f"get video_description error: {e}")
-        return None
-
-def get_payload_image_url(image_bytes: bytes, filelogger):
-    try:
-        mime_type = get_image_format(image_bytes, filelogger)
-        image_base64 = base64.b64encode(image_bytes).decode("utf-8")
-        data_url = f"data:image/{mime_type};base64,{image_base64}"
-        filelogger.info(f"get image_url success: {str(data_url)[:200]}")
-        return data_url
-    except Exception as e:
-        filelogger.error(f"get image_url error: {e}")
-        return None
-
-def get_image_format(image_bytes, filelogger) -> str:
-    try:
-        img = Image.open(io.BytesIO(image_bytes))
-        fmt = img.format.lower()
-        fmt = "jpeg" if fmt == "jpg" else fmt
-        return fmt
-    except Exception as e:
-        filelogger.error(f"Cannot determine image format: {e}")
-        return "png"
-
-def get_params_width(params: Dict):
-    return int(params.get("width", 1280))
-
-def get_params_height(params: Dict):
-    return int(params.get("height", 720))
-
-def get_params_infer_steps(params: Dict):
-    return int(params.get("num_inference_steps", 20))
-
-def get_params_resolution(params: Dict):
-    return str(params.get("resolution", "720P"))
-
-def get_params_waterDisable(params: Dict):
-    return str(params.get("waterDisable", True)).lower() == "true"
-
-def get_params_seed(params: Dict):
-    return int(params.get("seed", 1234))
-
+def _normalize_reference_url(reference_url: str, filelogger) -> str:
+    """
+    规范化 reference_url，支持两种输入格式：
+    1. http(s) 图像链接 — 原样返回
+    2. base64 数据（无 data: 前缀） — 补全 data:image/png;base64, 前缀
+    """
+    if reference_url.startswith("http://") or reference_url.startswith("https://"):
+        return reference_url
+    if reference_url.startswith("data:"):
+        return reference_url
+    # 裸 base64 字符串，补全 data URI 前缀
+    filelogger.info("reference_url is raw base64, prepended data:image/png;base64, prefix")
+    return f"data:image/png;base64,{reference_url}"
 
 def resp_content(status, output_json: dict):
     resd = ResponseData()
-    resd.key = "video"
+    resd.key = "raw_resp"
     resd.setDataType(DataText)
     resd.status = status
     resd.setData(json.dumps(output_json, ensure_ascii=False).encode("utf-8"))
     return resd
 
-def resp_usage(status, usage_json: dict):
-    resd = ResponseData()
-    resd.key = "usage"
-    resd.setDataType(DataText)
-    resd.status = status
-    resd.setData(json.dumps(usage_json, ensure_ascii=False).encode("utf-8"))
-    return resd
 
 class RequestMode(enum.Enum):
     ONCE = "once"
@@ -190,8 +146,8 @@ class RequestInfo:
         self.user_tag = user_tag
         self.params = params
         self.requests = []
-        self.image_chunks = []          # I2V 图片分片缓存
-        self.prompt = None              # 缓存 prompt，避免分片阶段重复提取
+        self.raw_req_chunks = []        # raw_req 分片缓存
+        self.raw_req = None             # 解析后的 raw_req dict
         self.stop_q = queue.Queue()
         self.out_q = queue.Queue()
         self.task_status = "idle"  # idle / queued / processing / completed / failed
@@ -202,14 +158,12 @@ class PromptInferenceInfo:
                  mode: RequestMode,
                  prompt: str,
                  requestInfo: RequestInfo,
-                 img_url: str = None,
                  result_q: queue.Queue = None):
         self.wrapper = wrapper
         self.requestInfo = requestInfo
         self.thread_id = thread_id
         self.mode = mode
         self.prompt = prompt
-        self.img_url = img_url
         self.request_id = str(uuid.uuid4().hex)
         self.result_q = result_q
 
@@ -370,52 +324,51 @@ class Wrapper(WrapperBase):
                     self.filelogger.error(f"handle not found: {handle}")
                     return -1
 
-            # 提取并缓存 prompt（仅取首个非空值）
-            prompt = get_payload_text(reqData, self.filelogger)
-            if prompt:
-                requestInfo.prompt = prompt
+            # --- raw_req 分片流式接收 ---
+            raw_req_node = reqData.get("raw_req")
+            if raw_req_node:
+                raw_req_data = raw_req_node.data
+                raw_req_status = raw_req_node.status
 
-            img_url = None
+                # 缓存本次收到的 raw_req 分片
+                with self.request_map_lock:
+                    requestInfo.raw_req_chunks.append(raw_req_data)
 
-            if self.task_type == "i2v":
-                messages_image = reqData.get("image_url")
-                if messages_image:
-                    image_data = messages_image.data
-                    messages_status = messages_image.status
+                # raw_req 尚未传输完毕，仅缓存
+                if raw_req_status != DataEnd:
+                    self.filelogger.debug(
+                        f"raw_req chunk received, status={raw_req_status}, "
+                        f"accumulated chunks={len(requestInfo.raw_req_chunks)}, handle: {handle}")
+                    return 0
 
-                    # 缓存本次收到的图片分片
-                    with self.request_map_lock:
-                        requestInfo.image_chunks.append(image_data)
+                # DataEnd: raw_req 传输完毕，拼合并解析 JSON
+                with self.request_map_lock:
+                    raw_req_bytes = b''.join(requestInfo.raw_req_chunks)
+                    requestInfo.raw_req_chunks.clear()
+                try:
+                    raw_req_str = raw_req_bytes.decode("utf-8")
+                    requestInfo.raw_req = json.loads(raw_req_str)
+                    self.filelogger.info(f"raw_req parsed successfully, handle: {handle}")
+                except Exception as e:
+                    self.filelogger.error(f"Failed to parse raw_req JSON: {e}")
+                    return -1
+            else:
+                # 非 raw_req 帧，跳过（数据尚未到达）
+                return 0
 
-                    # 图片数据尚未传输完毕，仅缓存，不提交任务
-                    if messages_status != DataEnd:
-                        self.filelogger.debug(
-                            f"i2v image chunk received, status={messages_status}, "
-                            f"accumulated chunks={len(requestInfo.image_chunks)}, handle: {handle}")
-                        return 0
-
-                    # DataEnd: 图片传输完毕，拼合完整图片
-                    with self.request_map_lock:
-                        messages_bytes = b''.join(requestInfo.image_chunks)
-                        requestInfo.image_chunks.clear()
-                    img_url = get_payload_image_url(messages_bytes, self.filelogger)
-                    if not img_url:
-                        self.filelogger.error("Failed to process image for i2v")
-                        return -1
-                    self.filelogger.info(f"i2v image assembled, size={len(messages_bytes)} bytes, handle: {handle}")
-
-            # 使用缓存的 prompt 进行最终校验
-            final_prompt = requestInfo.prompt
-            if not final_prompt:
-                self.filelogger.error("prompt is required")
+            # 校验 raw_req
+            prompt = requestInfo.raw_req.get("prompt")
+            if not prompt:
+                self.filelogger.error("prompt is required in raw_req")
                 return -1
 
             thread_id = self.thread_pool.alloc_min_thread()
-            inferenceInfo = PromptInferenceInfo(self, thread_id, RequestMode.STREAM, final_prompt, requestInfo, img_url)
+            inferenceInfo = PromptInferenceInfo(self, thread_id, RequestMode.STREAM, prompt, requestInfo)
 
             self.thread_pool.put_task(thread_id, inferenceInfo)
             with self.request_map_lock:
-                self.request_map[handle].requests.append(inferenceInfo.request_id)
+                requestInfo.handle = handle
+                requestInfo.requests.append(inferenceInfo.request_id)
 
             self.filelogger.debug(
                 f"success wrapperWrite handle:{handle}, thread_id:{thread_id},request_id:{inferenceInfo.request_id}")
@@ -447,7 +400,7 @@ class Wrapper(WrapperBase):
             # 无结果, 返回当前任务运行状态
             status_resp = Response()
             video_info = {
-                "task_status": requestInfo.task_status
+                "status": requestInfo.task_status
             }
             content = resp_content(DataContinue, video_info)
             status_resp.list = [content]
@@ -511,15 +464,41 @@ class Wrapper(WrapperBase):
             self.filelogger.info(f"====>inference abort before infer, {request_id}")
             return
 
-        params = requestInfo.params
+        raw_req = requestInfo.raw_req
         prompt = inferenceInfo.prompt
-        img_url = inferenceInfo.img_url
 
-        # 获取并校验尺寸
-        width = get_params_width(params)
-        height = get_params_height(params)
-        size = f"{width}x{height}"
+        # 从 raw_req 解析各字段
+        size = raw_req.get("size", "1280x720")
+        negative_prompt = raw_req.get("negative_prompt") or None
+        reference_url = raw_req.get("reference_url") or None
+        # 规范化 reference_url：支持 http(s) 链接 和 base64 数据
+        if reference_url:
+            reference_url = _normalize_reference_url(reference_url, self.filelogger)
+        seed = raw_req.get("seed")
+        if seed is not None and seed != "":
+            seed = int(seed)
+        else:
+            seed = None
+        num_inference_steps = raw_req.get("num_inference_steps")
+        if num_inference_steps:
+            num_inference_steps = int(num_inference_steps)
+        guidance_scale = raw_req.get("guidance_scale")
+        if guidance_scale is not None and guidance_scale != "":
+            guidance_scale = float(guidance_scale)
+        else:
+            guidance_scale = None
+        seconds = raw_req.get("seconds")
+        if seconds is not None and seconds != "":
+            seconds = int(seconds)
+        else:
+            seconds = None
+        fps = raw_req.get("fps")
+        if fps is not None and fps != "":
+            fps = int(fps)
+        else:
+            fps = None
 
+        # 校验尺寸
         supported_sizes = set()
         for res in self.supported_resolutions[self.model_name]:
             supported_sizes.update(RESOLUTIONS_TOSIZE[res])
@@ -528,17 +507,6 @@ class Wrapper(WrapperBase):
             ori_size = size
             size = "1280x720" if self.model_name not in ["wan2.1-t2v-1.3b"] else "832x480"
             self.filelogger.warning(f"{self.model_name} unsupported size {ori_size}, use {size} instead.")
-
-        resolution = get_params_resolution(params)
-        if resolution not in self.supported_resolutions[self.model_name]:
-            ori_resolution = resolution
-            resolution = "720P" if self.model_name not in ["wan2.1-t2v-1.3b"] else "480P"
-            self.filelogger.warning(f"{self.model_name} unsupported resolution {ori_resolution}, use {resolution} instead.")
-
-        negative_prompt = params.get("negative_prompt", None)
-        num_inference_steps = get_params_infer_steps(params)
-        waterDisable = get_params_waterDisable(params)
-        seed = get_params_seed(params)
 
         self.filelogger.info(f"Creating video generation task, prompt: {prompt[:100]}...")
         requestInfo.task_status = "queued"
@@ -552,21 +520,27 @@ class Wrapper(WrapperBase):
             extra_body = {}
             if negative_prompt:
                 extra_body["negative_prompt"] = negative_prompt
-            if seed:
+            if seed is not None:
                 extra_body["seed"] = seed
             if num_inference_steps:
                 extra_body["num_inference_steps"] = num_inference_steps
+            if guidance_scale is not None:
+                extra_body["guidance_scale"] = guidance_scale
+            if fps is not None:
+                extra_body["fps"] = fps
 
+            if seconds is not None:
+                req_params["seconds"] = seconds
             req_params["extra_body"] = extra_body
 
             # I2V 需要传入图片
             if self.task_type == "i2v":
-                if not img_url:
-                    self.filelogger.error("i2v task requires image input")
-                    res = self._response_err(ERROR_IMAGE_READ_FAILED, "i2v task requires image input")
+                if not reference_url:
+                    self.filelogger.error("i2v task requires reference_url in raw_req")
+                    res = self._response_err(ERROR_IMAGE_READ_FAILED, "i2v task requires reference_url in raw_req")
                     self._send_response(res, requestInfo)
                     return
-                extra_body["reference_url"] = img_url
+                extra_body["reference_url"] = reference_url
 
             self.filelogger.debug(f"video task params: {str(req_params)[:1000]}")
             rsp = await asyncio.to_thread(self.client.videos.create, **req_params)
@@ -585,12 +559,8 @@ class Wrapper(WrapperBase):
 
             # 发送 DataBegin 状态
             res_begin = Response()
-            video_info = {
-                "request_id": request_id,
-                "task_id": task_id,
-                "task_status": rsp.status,
-                "object": rsp.object
-            }
+            video_info = {"request_id": request_id}
+            video_info.update(rsp.model_dump())
             content = resp_content(DataBegin, video_info)
             res_begin.list = [content]
             self._send_response(res_begin, requestInfo)
@@ -640,24 +610,12 @@ class Wrapper(WrapperBase):
                     requestInfo.task_status = "completed"
                     self.filelogger.info(f"Video generation completed, task_id: {task_id}, inference_time: {getattr(rsp, 'inference_time_s', None)}")
 
-                    video_info = {
-                        "request_id": request_id,
-                        "task_id": rsp.id,
-                        "task_status": rsp.status,
-                        "object": rsp.object,
-                        "video_url": getattr(rsp, 'url', None)
-                    }
-
-                    usage_info = {
-                        "duration": getattr(rsp, 'seconds', None),
-                        "size": getattr(rsp, 'size', None),
-                        "inference_time": getattr(rsp, 'inference_time_s', None)
-                    }
+                    video_info = {"request_id": request_id}
+                    video_info.update(rsp.model_dump())
 
                     res = Response()
                     content = resp_content(DataEnd, video_info)
-                    usage = resp_usage(DataEnd, usage_info)
-                    res.list = [content, usage]
+                    res.list = [content]
                     return res
 
                 elif current_status == "failed":
@@ -670,12 +628,9 @@ class Wrapper(WrapperBase):
                 else:
                     # 发送进度更新 DataContinue
                     res_continue = Response()
-                    video_info = {
-                        "request_id": request_id,
-                        "task_id": rsp.id,
-                        "task_status": rsp.status,
-                        "object": rsp.object
-                    }
+                    video_info = {"request_id": request_id}
+                    video_info.update(rsp.model_dump())
+
                     content = resp_content(DataContinue, video_info)
                     res_continue.list = [content]
                     self._send_response(res_continue, requestInfo)
