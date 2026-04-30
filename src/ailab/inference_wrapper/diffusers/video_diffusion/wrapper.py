@@ -40,6 +40,11 @@ ERROR_SERVER_NOT_READY = 1003
 ERROR_POLL_TIMEOUT = 1004
 ERROR_IMAGE_READ_FAILED = 1005
 
+# Constants
+DataNone = -1
+DataBegin = 0
+DataContinue = 1
+DataEnd = 2
 
 def _get_free_port() -> int:
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -262,7 +267,14 @@ class Wrapper(WrapperBase):
                 
                 self.model_name = config.get("modelName", "")
                 self.task_type = config.get("modelTaskType", "t2v")
-                self.supported_resolutions = config.get("supportedResolutions", {})
+                supported_resolutions = config.get("supportedResolutions", {})
+                if isinstance(supported_resolutions, str):
+                    try:
+                        supported_resolutions = json.loads(supported_resolutions)
+                    except Exception as e:
+                        self.filelogger.error(f"Failed to parse supportedResolutions JSON: {e}")
+                        supported_resolutions = {}
+                self.supported_resolutions = supported_resolutions
 
             # 使用环境变量 FULL_MODEL_PATH 作为模型路径
             self.base_model = os.environ.get("FULL_MODEL_PATH")
@@ -320,7 +332,7 @@ class Wrapper(WrapperBase):
         return s
 
     def wrapperWrite(self, handle: str, reqData: DataListCls) -> int:
-        self.filelogger.debug(f"start wrapperWrite, handle: {handle}")
+        self.filelogger.debug(f"start wrapperWrite, handle: {handle}, reqData: {reqData}")
         try:
             with self.request_map_lock:
                 requestInfo = self.request_map.get(handle)
@@ -328,7 +340,7 @@ class Wrapper(WrapperBase):
                     self.filelogger.error(f"handle not found: {handle}")
                     return -1
 
-            # --- raw_req 分片流式接收 ---
+            # --- raw_req 流式接收 ---
             raw_req_node = reqData.get("raw_req")
             if raw_req_node:
                 raw_req_data = raw_req_node.data
@@ -336,6 +348,10 @@ class Wrapper(WrapperBase):
 
                 # 缓存本次收到的 raw_req 分片
                 # aiges 框架保证同一 handle 的 wrapperWrite 串行调用，无需加锁
+                # data 可能是 str 或 bytes，统一转为 str
+                if isinstance(raw_req_data, bytes):
+                    raw_req_data = raw_req_data.decode("utf-8")
+                self.filelogger.debug(f"raw_req_data: {raw_req_data}")
                 requestInfo.raw_req_chunks.append(raw_req_data)
 
                 # raw_req 尚未传输完毕，仅缓存
@@ -346,27 +362,38 @@ class Wrapper(WrapperBase):
                     return 0
 
                 # DataEnd: raw_req 传输完毕，拼合并解析 JSON
-                raw_req_bytes = b''.join(requestInfo.raw_req_chunks)
+                raw_req_str = ''.join(requestInfo.raw_req_chunks)
                 requestInfo.raw_req_chunks.clear()
+                self.filelogger.debug(f"raw_req_str: {raw_req_str[:500]}, handle: {handle}")
                 try:
-                    raw_req_str = raw_req_bytes.decode("utf-8")
-                    requestInfo.raw_req = json.loads(raw_req_str)
+                    parsed = json.loads(raw_req_str)
+                    # 处理双重 JSON 编码：如果解析结果仍是字符串，再解析一次
+                    if isinstance(parsed, str):
+                        self.filelogger.warning(f"raw_req is double-encoded JSON, parsing again, handle: {handle}")
+                        parsed = json.loads(parsed)
+                    requestInfo.raw_req = parsed
                     self.filelogger.info(f"raw_req parsed successfully, handle: {handle}")
+                    if not isinstance(requestInfo.raw_req, dict):
+                        self.filelogger.error(f"raw_req is not a dict, got {type(requestInfo.raw_req).__name__}: {str(requestInfo.raw_req)[:200]}, handle: {handle}")
+                        requestInfo.task_status = "failed"
+                        self._send_end_response(requestInfo, {"status": "failed", "error": f"raw_req is not a dict, got {type(requestInfo.raw_req).__name__}"})
+                        return -1
                 except Exception as e:
                     self.filelogger.error(f"Failed to parse raw_req JSON: {e}")
-                    requestInfo.finished_event.set()
                     requestInfo.task_status = "failed"
+                    self._send_end_response(requestInfo, {"status": "failed", "error": f"Failed to parse raw_req JSON: {e}"})
                     return -1
             else:
                 # 非 raw_req 帧，跳过（数据尚未到达）
+                self.filelogger.debug(f"wrapperWrite: no raw_req node in this frame, handle: {handle}")
                 return 0
 
             # 校验 raw_req
             prompt = requestInfo.raw_req.get("prompt")
             if not prompt:
                 self.filelogger.error("prompt is required in raw_req")
-                requestInfo.finished_event.set()
                 requestInfo.task_status = "failed"
+                self._send_end_response(requestInfo, {"status": "failed", "error": "prompt is required in raw_req"})
                 return -1
 
             thread_id = self.thread_pool.alloc_min_thread()
@@ -391,8 +418,9 @@ class Wrapper(WrapperBase):
     def wrapperRead(self, handle: str) -> Response:
         """
         同步读取结果, 对应 aiges 配置 asyncMode = false
-        非阻塞: 有结果返回结果, 无结果返回当前任务运行状态
+        阻塞等待 out_q 数据: 有结果立即返回, 60s 超时返回异常
         """
+        time.sleep(5)
         with self.request_map_lock:
             requestInfo = self.request_map.get(handle)
         if not requestInfo:
@@ -406,30 +434,15 @@ class Wrapper(WrapperBase):
             # 发送 cancelled DataEnd 兜底
             self._send_end_response(requestInfo, {"status": "cancelled", "error": "Session destroyed"})
 
-        # 非阻塞读取: 逐条取出 out_q 中的结果
+        # 阻塞等待最多 60s，等 out_q 有数据立即返回
         try:
-            rs = requestInfo.out_q.get_nowait()
+            rs = requestInfo.out_q.get(timeout=60)
         except queue.Empty:
-            # 检查是否已进入终态（兜底：worker 已完成但 out_q 中无 DataEnd）
-            if requestInfo.finished_event.is_set():
-                self._send_end_response(requestInfo, {"status": requestInfo.task_status})
-                try:
-                    rs = requestInfo.out_q.get_nowait()
-                except queue.Empty:
-                    # 极端情况：end_sent 已设但 out_q 仍空
-                    status_resp = Response()
-                    content = resp_content(DataEnd, {"status": requestInfo.task_status})
-                    status_resp.list = [content]
-                    return status_resp
-            else:
-                # 无结果, 返回当前任务运行状态
-                status_resp = Response()
-                video_info = {
-                    "status": requestInfo.task_status
-                }
-                content = resp_content(DataContinue, video_info)
-                status_resp.list = [content]
-                return status_resp
+            # 60s 超时无数据，返回超时异常
+            self.filelogger.error(f"wrapperRead 60s timeout, handle: {handle}")
+            r = Response()
+            r = r.response_err(ERROR_POLL_TIMEOUT)
+            return r
 
         if not isinstance(rs, Response):
             self.filelogger.error(f"wrapperRead invalid response type: {type(rs)}")
@@ -451,7 +464,9 @@ class Wrapper(WrapperBase):
         with self.request_map_lock:
             ri = self.request_map.get(handle)
             if ri is None:
-                return -1
+                # handle 已被 wrapperRead 在 DataEnd 后清理，会话正常结束
+                self.filelogger.info(f"wrapperDestroy: handle already cleaned up, handle: {handle}")
+                return 0
             # 软取消：通知 worker 停止
             ri.stop_event.set()
             ri._destroy_pending = True
@@ -486,7 +501,10 @@ class Wrapper(WrapperBase):
                     old = requestInfo.out_q.get_nowait()
                     # 如果是终态数据，重新放回
                     if isinstance(old, Response) and old.list and any(rd.status == DataEnd for rd in old.list):
-                        requestInfo.out_q.put_nowait(old)
+                        try:
+                            requestInfo.out_q.put_nowait(old)
+                        except queue.Full:
+                            self.filelogger.error(f"out_q full when putting back DataEnd, handle: {requestInfo.handle}")
                 except queue.Empty:
                     break
             try:
@@ -530,6 +548,11 @@ class Wrapper(WrapperBase):
                 return
 
             raw_req = requestInfo.raw_req
+            if not isinstance(raw_req, dict):
+                self.filelogger.error(f"raw_req is not dict, type={type(raw_req).__name__}, value={str(raw_req)[:200]}")
+                requestInfo.task_status = "failed"
+                self._send_end_response(requestInfo, {"status": "failed", "error": f"raw_req is not a dict, got {type(raw_req).__name__}"})
+                return
             prompt = inferenceInfo.prompt
 
             # 从 raw_req 解析各字段
@@ -545,8 +568,10 @@ class Wrapper(WrapperBase):
             else:
                 seed = None
             num_inference_steps = raw_req.get("num_inference_steps")
-            if num_inference_steps:
+            if num_inference_steps is not None and num_inference_steps != "":
                 num_inference_steps = int(num_inference_steps)
+            else:
+                num_inference_steps = None
             guidance_scale = raw_req.get("guidance_scale")
             if guidance_scale is not None and guidance_scale != "":
                 guidance_scale = float(guidance_scale)
@@ -565,8 +590,9 @@ class Wrapper(WrapperBase):
 
             # 校验尺寸
             supported_sizes = set()
-            for res in self.supported_resolutions[self.model_name]:
-                supported_sizes.update(RESOLUTIONS_TOSIZE[res])
+            model_resolutions = self.supported_resolutions.get(self.model_name, [])
+            for res in model_resolutions:
+                supported_sizes.update(RESOLUTIONS_TOSIZE.get(res, []))
 
             if size not in supported_sizes:
                 ori_size = size
@@ -587,7 +613,7 @@ class Wrapper(WrapperBase):
                     extra_body["negative_prompt"] = negative_prompt
                 if seed is not None:
                     extra_body["seed"] = seed
-                if num_inference_steps:
+                if num_inference_steps is not None:
                     extra_body["num_inference_steps"] = num_inference_steps
                 if guidance_scale is not None:
                     extra_body["guidance_scale"] = guidance_scale
@@ -649,7 +675,9 @@ class Wrapper(WrapperBase):
 
         except Exception as e:
             # 外层兜底：任何未预期的异常
-            self.filelogger.error(f"Unexpected error in create_video_task: {e}")
+            import traceback
+            traceback.print_exc()
+            self.filelogger.error(f"Unexpected error in create_video_task: {e}", exc_info=True)
             requestInfo.task_status = "failed"
             self._send_end_response(requestInfo, {"status": "failed", "error": f"Unexpected error: {e}"})
 
