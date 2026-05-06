@@ -7,15 +7,28 @@ sglang diffusion video wrapper 插件测试脚本
 1. T2V (Text-to-Video) 测试
 2. I2V (Image-to-Video) 测试
 
+请求通过 raw_req 字段以分片流式方式传入 JSON payload，格式如:
+{
+    "prompt": "A curious raccoon exploring a forest, cinematic lighting",
+    "negative_prompt": "",
+    "size": "1280x720",
+    "seconds": 4,
+    "fps": 24,
+    "num_inference_steps": "",
+    "guidance_scale": 5.0,
+    "seed": 42,
+    "reference_url": "https://example.com/image.jpg"  # I2V only
+}
+
 使用方式:
 1. 运行 T2V 测试 (使用 --config 传入配置文件):
    python test_wrapper_plugin.py --mode t2v --config config_t2v.json --prompt "A cat playing piano"
 
-2. 运行 I2V 测试:
-   python test_wrapper_plugin.py --mode i2v --config config_i2v.json --image-path /path/to/image.png --prompt "The cat starts moving"
+2. 运行 I2V 测试 (使用图片 URL):
+   python test_wrapper_plugin.py --mode i2v --config config_i2v.json --image-url https://example.com/cat.jpg --prompt "The cat starts moving"
 
-3. 也可通过命令行参数覆盖配置文件中的字段:
-   python test_wrapper_plugin.py --mode t2v --config config_t2v.json --model-path /path/to/model
+3. 运行 I2V 测试 (使用本地图片, 自动转 base64):
+   python test_wrapper_plugin.py --mode i2v --config config_i2v.json --image-path /path/to/image.png --prompt "The cat starts moving"
 
 配置文件格式 (JSON):
 {
@@ -34,6 +47,7 @@ sglang diffusion video wrapper 插件测试脚本
 """
 
 import argparse
+import base64
 import json
 import os
 import sys
@@ -45,13 +59,15 @@ from aiges.core.types import DataBegin, DataContinue, DataEnd
 
 # ==================== 配置区 ====================
 # 默认模型配置
-DEFAULT_MODEL_PATH = os.environ.get("FULL_MODEL_PATH", "/workspace/LLamFile/ModelFile/wan_ai/Wan2.1-T2V-1.3B-Diffusers")
+DEFAULT_MODEL_PATH = os.environ.get("FULL_MODEL_PATH", "/workspace/LLamFile/ModelFile/wan_ai/Wan2.2-T2V-A14B-Diffusers")
+DEFAULT_MODEL_NAME_T2V = "wan2.2-t2v-14b"
+DEFAULT_MODEL_NAME_I2V = "wan2.2-i2v-14b"
 
 # 默认推理参数
-DEFAULT_WIDTH = 832
-DEFAULT_HEIGHT = 480
+DEFAULT_SIZE = "832x480"
 DEFAULT_STEPS = 20
 DEFAULT_SEED = 1234
+DEFAULT_GUIDANCE_SCALE = 5.0
 
 # 轮询配置
 DEFAULT_POLL_INTERVAL_MS = 5000
@@ -76,23 +92,35 @@ def load_config(config_path: str) -> dict:
 def build_config(args) -> dict:
     """
     构建 wrapperInit 所需的 config 字典。
+    wrapper 要求: modelName, modelTaskType, supportedResolutions 必须存在。
     优先级: 命令行参数 > 配置文件 > 默认值
     """
     # 从配置文件加载基础配置
     config = load_config(args.config)
 
+    # 确定默认 model_name (根据模式)
+    default_model_name = DEFAULT_MODEL_NAME_I2V if args.mode == "i2v" else DEFAULT_MODEL_NAME_T2V
+
     # 命令行参数覆盖
     if args.model_path:
         os.environ["FULL_MODEL_PATH"] = args.model_path
-    if args.pretrained_name:
+    if args.model_name:
+        config["modelName"] = args.model_name
+    elif args.pretrained_name:
         config.setdefault("modelName", args.pretrained_name)
-    if args.mode:
-        config.setdefault("modelTaskType", args.mode)
-    if args.poll_interval:
-        config.setdefault("pollIntervalMs", str(args.poll_interval))
+    # 确保 modelName 始终存在 (wrapperInit 必需)
+    if "modelName" not in config or not config["modelName"]:
+        config["modelName"] = default_model_name
 
-    # 支持的分辨率: 如果配置文件未指定，根据模式生成默认值
-    model_name = config.get("modelName", "")
+    # 确保 modelTaskType 始终存在 (wrapperInit 必需, 值为 t2v/i2v)
+    config["modelTaskType"] = args.mode
+
+    if args.poll_interval:
+        config["pollIntervalMs"] = str(args.poll_interval)
+
+    # 支持的分辨率: 如果配置文件未指定，根据 model_name 生成默认值
+    # 与 wrapper 中 RESOLUTIONS_TOSIZE 保持一致
+    model_name = config.get("modelName", default_model_name)
     if "supportedResolutions" not in config or not config["supportedResolutions"]:
         if "i2v" in model_name:
             config["supportedResolutions"] = {model_name: ["480P", "720P"]}
@@ -123,10 +151,9 @@ def setup_environment(args, config: dict):
     if args.extra_args:
         os.environ["SGLANG_CMD_EXTRA_ARGS"] = args.extra_args
 
-    # FULL_MODEL_PATH: 优先级: 命令行 --model-path > 环境变量 FULL_MODEL_PATH > DEFAULT_MODEL_PATH
-    if args.model_path:
-        os.environ["FULL_MODEL_PATH"] = args.model_path
-    elif "FULL_MODEL_PATH" not in os.environ:
+    # FULL_MODEL_PATH: 命令行 --model-path 已在 build_config() 中设置
+    # 此处仅做兜底，确保环境变量始终存在
+    if "FULL_MODEL_PATH" not in os.environ:
         os.environ["FULL_MODEL_PATH"] = DEFAULT_MODEL_PATH
 
     # 设置 Python 路径
@@ -151,10 +178,62 @@ def import_wrapper():
     return Wrapper, wrapper_module
 
 
-def read_image_bytes(image_path: str) -> bytes:
-    """读取图片二进制数据"""
+def image_to_base64_data_url(image_path: str) -> str:
+    """读取本地图片文件并转为 data:image/...;base64,... 格式"""
+    import imghdr
     with open(image_path, "rb") as f:
-        return f.read()
+        image_bytes = f.read()
+    fmt = imghdr.what(None, h=image_bytes)
+    if fmt == "jpg":
+        fmt = "jpeg"
+    if not fmt:
+        fmt = "png"
+    b64_str = base64.b64encode(image_bytes).decode("utf-8")
+    return f"data:image/{fmt};base64,{b64_str}"
+
+
+def build_raw_req(args, reference_url=None) -> dict:
+    """
+    构建 raw_req JSON payload
+    """
+    raw_req = {
+        "prompt": args.prompt,
+        "size": args.size,
+    }
+    if args.negative_prompt:
+        raw_req["negative_prompt"] = args.negative_prompt
+    if args.seed is not None:
+        raw_req["seed"] = args.seed
+    if args.steps:
+        raw_req["num_inference_steps"] = args.steps
+    if args.guidance_scale is not None:
+        raw_req["guidance_scale"] = args.guidance_scale
+    if args.seconds:
+        raw_req["seconds"] = args.seconds
+    if args.fps:
+        raw_req["fps"] = args.fps
+    if reference_url:
+        raw_req["reference_url"] = reference_url
+    return raw_req
+
+
+def write_raw_req_stream(wrapper, handle, raw_req: dict):
+    """
+    以分片流式方式写入 raw_req 到 wrapperWrite，模拟 aiges 框架的 DataBegin/DataContinue/DataEnd 流程
+    """
+    raw_req_bytes = json.dumps(raw_req, ensure_ascii=False).encode("utf-8")
+
+    # 单次发送（数据量小，直接 DataEnd）
+    node = DataListNode()
+    node.key = "raw_req"
+    node.data = raw_req_bytes
+    node.status = DataEnd
+
+    data_list = DataListCls()
+    data_list.list = [node]
+
+    ret = wrapper.wrapperWrite(handle, data_list)
+    return ret
 
 
 def poll_wrapper_read(wrapper, handle, timeout_s, read_interval_s=3):
@@ -206,9 +285,10 @@ def poll_wrapper_read(wrapper, handle, timeout_s, read_interval_s=3):
                 return True, results
             else:
                 # DataContinue: 简洁打印状态
-                task_status = content.get("task_status", "?") if isinstance(content, dict) else "?"
-                task_id = content.get("task_id", "?") if isinstance(content, dict) else "?"
-                print(f"[READ #{read_count}] key={item.key}, status={status_name}, task_id={task_id}, task_status={task_status}")
+                task_status = content.get("status", "?") if isinstance(content, dict) else "?"
+                task_id = content.get("id", "?") if isinstance(content, dict) else "?"
+                progress = content.get("progress", "?") if isinstance(content, dict) else "?"
+                print(f"[READ #{read_count}] key={item.key}, status={status_name}, task_id={task_id}, task_status={task_status}, progress={progress}")
 
         time.sleep(read_interval_s)
 
@@ -222,38 +302,22 @@ def test_t2v(wrapper, args):
     print(" T2V (Text-to-Video) Test")
     print("=" * 60)
     print(f"Prompt: {args.prompt[:100]}...")
-    print(f"Size: {args.width}x{args.height}")
-    print(f"Steps: {args.steps}, Seed: {args.seed}")
+    print(f"Size: {args.size}")
+
+    # 构建 raw_req payload
+    raw_req = build_raw_req(args)
+    print(f"raw_req: {json.dumps(raw_req, ensure_ascii=False)[:300]}")
 
     # 1. 创建会话
-    params = {
-        "width": args.width,
-        "height": args.height,
-        "num_inference_steps": args.steps,
-        "seed": args.seed
-    }
-    if args.negative_prompt:
-        params["negative_prompt"] = args.negative_prompt
-
     print("\n[1] Creating session...")
-    session = wrapper.wrapperCreate(params, sid="test_t2v_session", usrTag="test_t2v")
+    session = wrapper.wrapperCreate({}, sid="test_t2v_session", usrTag="test_t2v")
     handle = session.handle
     print(f"    Handle: {handle}")
 
     try:
-        # 2. 写入请求
-        print("\n[2] Writing request...")
-
-        prompt_node = DataListNode()
-        prompt_node.key = "video_description"
-        prompt_node.data = args.prompt.encode("utf-8")
-        prompt_node.status = DataEnd
-
-        data_list = DataListCls()
-        data_list.list = []
-        data_list.list.append(prompt_node)
-
-        ret = wrapper.wrapperWrite(handle, data_list)
+        # 2. 写入 raw_req 请求
+        print("\n[2] Writing raw_req request...")
+        ret = write_raw_req_stream(wrapper, handle, raw_req)
         print(f"    wrapperWrite returned: {ret}")
 
         if ret != 0:
@@ -278,7 +342,7 @@ def test_t2v(wrapper, args):
         video_url = None
         for r in results:
             if r["status"] == DataEnd and isinstance(r.get("content"), dict):
-                video_url = r["content"].get("video_url")
+                video_url = r["content"].get("url")
 
             print(f"    - {r['key']}: {r['status_name']}", end="")
             if isinstance(r.get("content"), dict):
@@ -304,56 +368,39 @@ def test_i2v(wrapper, args):
     print(" I2V (Image-to-Video) Test")
     print("=" * 60)
     print(f"Prompt: {args.prompt[:100]}...")
-    print(f"Image: {args.image_path}")
-    print(f"Size: {args.width}x{args.height}")
 
-    if not args.image_path:
-        print("[ERROR] --image-path is required for I2V mode")
+    # 确定 reference_url
+    reference_url = None
+    if args.image_url:
+        reference_url = args.image_url
+        print(f"Reference URL: {reference_url}")
+    elif args.image_path:
+        if not os.path.exists(args.image_path):
+            print(f"[ERROR] Image file not found: {args.image_path}")
+            return False
+        reference_url = image_to_base64_data_url(args.image_path)
+        print(f"Reference URL: (base64 from {args.image_path}, {len(reference_url)} chars)")
+    else:
+        print("[ERROR] --image-url or --image-path is required for I2V mode")
         return False
 
-    if not os.path.exists(args.image_path):
-        print(f"[ERROR] Image file not found: {args.image_path}")
-        return False
-
-    # 读取图片
-    image_bytes = read_image_bytes(args.image_path)
-    print(f"Image size: {len(image_bytes)} bytes")
+    # 构建 raw_req payload
+    raw_req = build_raw_req(args, reference_url=reference_url)
+    # 不打印完整 raw_req 避免刷屏 base64
+    log_req = {k: (v[:80] + "..." if k == "reference_url" and isinstance(v, str) and len(v) > 80 else v)
+               for k, v in raw_req.items()}
+    print(f"raw_req: {json.dumps(log_req, ensure_ascii=False)[:300]}")
 
     # 1. 创建会话
-    params = {
-        "width": args.width,
-        "height": args.height,
-        "num_inference_steps": args.steps,
-        "seed": args.seed
-    }
-    if args.negative_prompt:
-        params["negative_prompt"] = args.negative_prompt
-
     print("\n[1] Creating session...")
-    session = wrapper.wrapperCreate(params, sid="test_i2v_session", usrTag="test_i2v")
+    session = wrapper.wrapperCreate({}, sid="test_i2v_session", usrTag="test_i2v")
     handle = session.handle
     print(f"    Handle: {handle}")
 
     try:
-        # 2. 写入请求
-        print("\n[2] Writing request...")
-
-        prompt_node = DataListNode()
-        prompt_node.key = "video_description"
-        prompt_node.data = args.prompt.encode("utf-8")
-        prompt_node.status = DataEnd
-
-        image_begin_node = DataListNode()
-        image_begin_node.key = "image_url"
-        image_begin_node.data = image_bytes
-        image_begin_node.status = DataEnd
-
-        data_list = DataListCls()
-        data_list.list = []
-        data_list.list.append(prompt_node)
-        data_list.list.append(image_begin_node)
-
-        ret = wrapper.wrapperWrite(handle, data_list)
+        # 2. 写入 raw_req 请求
+        print("\n[2] Writing raw_req request...")
+        ret = write_raw_req_stream(wrapper, handle, raw_req)
         print(f"    wrapperWrite returned: {ret}")
 
         if ret != 0:
@@ -378,7 +425,7 @@ def test_i2v(wrapper, args):
         video_url = None
         for r in results:
             if r["status"] == DataEnd and isinstance(r.get("content"), dict):
-                video_url = r["content"].get("video_url")
+                video_url = r["content"].get("url")
 
             print(f"    - {r['key']}: {r['status_name']}", end="")
             if isinstance(r.get("content"), dict):
@@ -411,7 +458,11 @@ Examples:
   python test_wrapper_plugin.py --mode t2v --config config_t2v.json \\
       --model-path /path/to/model --pretrained-name wan2.2-t2v-14b
 
-  # I2V 测试
+  # I2V 测试 (使用图片 URL)
+  python test_wrapper_plugin.py --mode i2v --config config_i2v.json \\
+      --image-url https://example.com/cat.jpg --prompt "The cat starts moving"
+
+  # I2V 测试 (使用本地图片)
   python test_wrapper_plugin.py --mode i2v --config config_i2v.json \\
       --image-path /path/to/image.jpg --prompt "The cat starts moving"
         """
@@ -429,7 +480,9 @@ Examples:
     parser.add_argument("--model-path", default=None,
                         help=f"Model path (overrides FULL_MODEL_PATH env, default: {DEFAULT_MODEL_PATH})")
     parser.add_argument("--pretrained-name", default=None,
-                        help="Model name, overrides config: wan2.2-t2v-14b, wan2.2-i2v-14b, wan2.1-t2v-1.3b")
+                        help="Model name (deprecated, use --model-name instead): wan2.2-t2v-14b, wan2.2-i2v-14b, wan2.1-t2v-1.3b")
+    parser.add_argument("--model-name", default=None,
+                        help="Model name for wrapperInit config.modelName (overrides --pretrained-name)")
     parser.add_argument("--extra-args", default="",
                         help="Extra sglang serve args (e.g., '--num-gpus 1')")
 
@@ -446,20 +499,26 @@ Examples:
     # 输入配置
     parser.add_argument("--prompt", default=None,
                         help="Text prompt for video generation")
-    parser.add_argument("--image-path", default=None,
-                        help="Image path for I2V mode")
     parser.add_argument("--negative-prompt", default=None,
                         help="Negative prompt")
+    parser.add_argument("--image-url", default=None,
+                        help="Image URL for I2V mode (http/https link)")
+    parser.add_argument("--image-path", default=None,
+                        help="Local image path for I2V mode (auto-converted to base64 data URL)")
 
     # 视频参数
-    parser.add_argument("--width", type=int, default=DEFAULT_WIDTH,
-                        help=f"Video width (default: {DEFAULT_WIDTH})")
-    parser.add_argument("--height", type=int, default=DEFAULT_HEIGHT,
-                        help=f"Video height (default: {DEFAULT_HEIGHT})")
+    parser.add_argument("--size", default=DEFAULT_SIZE,
+                        help=f"Video size WxH (default: {DEFAULT_SIZE})")
     parser.add_argument("--steps", type=int, default=DEFAULT_STEPS,
                         help=f"Inference steps (default: {DEFAULT_STEPS})")
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED,
                         help=f"Random seed (default: {DEFAULT_SEED})")
+    parser.add_argument("--guidance-scale", type=float, default=DEFAULT_GUIDANCE_SCALE,
+                        help=f"Guidance scale (default: {DEFAULT_GUIDANCE_SCALE})")
+    parser.add_argument("--seconds", type=int, default=None,
+                        help="Video duration in seconds")
+    parser.add_argument("--fps", type=int, default=None,
+                        help="Video frames per second")
 
     # 超时配置
     parser.add_argument("--poll-interval", type=int, default=DEFAULT_POLL_INTERVAL_MS,
@@ -495,7 +554,7 @@ Examples:
     # 校验必要字段
     model_name = config.get("modelName", "")
     if not model_name:
-        print(f"[ERROR] modelName is not set. Use --config or --pretrained-name")
+        print(f"[ERROR] modelName is not set. Use --config or --model-name")
         return 1
 
     if args.mode == "i2v" and "i2v" not in model_name:
