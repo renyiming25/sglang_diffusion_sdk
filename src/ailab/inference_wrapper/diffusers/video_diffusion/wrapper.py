@@ -420,7 +420,7 @@ class Wrapper(WrapperBase):
         同步读取结果, 对应 aiges 配置 asyncMode = false
         阻塞等待 out_q 数据: 有结果立即返回, 60s 超时返回异常
         """
-        time.sleep(5)
+        # time.sleep(5)
         with self.request_map_lock:
             requestInfo = self.request_map.get(handle)
         if not requestInfo:
