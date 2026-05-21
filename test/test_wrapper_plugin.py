@@ -3,18 +3,19 @@
 """
 sglang diffusion video wrapper 插件测试脚本
 
-基于 wrapperRead 同步读取模式 (asyncMode = false)，支持:
-1. T2V (Text-to-Video) 测试
-2. I2V (Image-to-Video) 测试
+模拟加载器加载流程，使用 wrapperOnceExecAsync + callback 模式：
+1. wrapperInit(config) — 初始化，启动 sglang serve
+2. wrapperOnceExecAsync(params, reqData, usrTag) — 提交请求
+3. callback 返回结果 — 视频生成结果 (含 video URL)
 
-请求通过 raw_req 字段以分片流式方式传入 JSON payload，格式如:
+请求通过 raw_req 字段传入 JSON payload，格式如:
 {
     "prompt": "A curious raccoon exploring a forest, cinematic lighting",
     "negative_prompt": "",
     "size": "1280x720",
     "seconds": 4,
     "fps": 24,
-    "num_inference_steps": "",
+    "num_inference_steps": 20,
     "guidance_scale": 5.0,
     "seed": 42,
     "reference_url": "https://example.com/image.jpg"  # I2V only
@@ -52,10 +53,11 @@ import json
 import os
 import sys
 import time
+import threading
 
 # aiges 框架导入
 from aiges.dto import Response, DataListNode, DataListCls
-from aiges.core.types import DataBegin, DataContinue, DataEnd
+from aiges.core.types import DataEnd
 
 # ==================== 配置区 ====================
 # 默认模型配置
@@ -69,11 +71,34 @@ DEFAULT_STEPS = 20
 DEFAULT_SEED = 1234
 DEFAULT_GUIDANCE_SCALE = 5.0
 
-# 轮询配置
-DEFAULT_POLL_INTERVAL_MS = 5000
-DEFAULT_POLL_TIMEOUT_S = 1800
-DEFAULT_READ_INTERVAL_S = 3
+# callback 等待超时
+DEFAULT_CALLBACK_TIMEOUT_S = 1800
 # ================================================
+
+
+# ---------- callback 结果收集 ----------
+
+class CallbackResultCollector:
+    """收集 callback 返回的结果，支持线程安全等待"""
+    def __init__(self):
+        self.result = None
+        self.error_code = None
+        self.event = threading.Event()
+
+    def on_callback(self, res, usr_tag):
+        """callback 回调函数，由 wrapper 线程池调用"""
+        if isinstance(res, Response) and res.list:
+            self.result = res
+            self.error_code = 0
+        elif isinstance(res, Response) and hasattr(res, 'err_code'):
+            self.error_code = res.err_code
+        else:
+            self.error_code = -1
+        self.event.set()
+
+    def wait(self, timeout_s: float) -> bool:
+        """等待 callback 返回，返回是否在超时前收到结果"""
+        return self.event.wait(timeout=timeout_s)
 
 
 def load_config(config_path: str) -> dict:
@@ -119,7 +144,6 @@ def build_config(args) -> dict:
         config["pollIntervalMs"] = str(args.poll_interval)
 
     # 支持的分辨率: 如果配置文件未指定，根据 model_name 生成默认值
-    # 与 wrapper 中 RESOLUTIONS_TOSIZE 保持一致
     model_name = config.get("modelName", default_model_name)
     if "supportedResolutions" not in config or not config["supportedResolutions"]:
         if "i2v" in model_name:
@@ -193,9 +217,7 @@ def image_to_base64_data_url(image_path: str) -> str:
 
 
 def build_raw_req(args, reference_url=None) -> dict:
-    """
-    构建 raw_req JSON payload
-    """
+    """构建 raw_req JSON payload"""
     raw_req = {
         "prompt": args.prompt,
         "size": args.size,
@@ -217,13 +239,10 @@ def build_raw_req(args, reference_url=None) -> dict:
     return raw_req
 
 
-def write_raw_req_stream(wrapper, handle, raw_req: dict):
-    """
-    以分片流式方式写入 raw_req 到 wrapperWrite，模拟 aiges 框架的 DataBegin/DataContinue/DataEnd 流程
-    """
+def build_req_data(raw_req: dict) -> DataListCls:
+    """构建 wrapperOnceExecAsync 所需的 DataListCls (包含 raw_req 字段)"""
     raw_req_bytes = json.dumps(raw_req, ensure_ascii=False).encode("utf-8")
 
-    # 单次发送（数据量小，直接 DataEnd）
     node = DataListNode()
     node.key = "raw_req"
     node.data = raw_req_bytes
@@ -231,73 +250,51 @@ def write_raw_req_stream(wrapper, handle, raw_req: dict):
 
     data_list = DataListCls()
     data_list.list = [node]
-
-    ret = wrapper.wrapperWrite(handle, data_list)
-    return ret
+    return data_list
 
 
-def poll_wrapper_read(wrapper, handle, timeout_s, read_interval_s=3):
+def monkey_patch_callback(collector: CallbackResultCollector):
     """
-    定时调用 wrapperRead 获取结果, 模拟加载器的同步读取模式
-
-    Returns:
-        (success, results): success=True 表示收到 DataEnd, results 为所有读取到的响应列表
+    Monkey-patch aiges callback 函数，将结果转发到 collector。
+    wrapper 内部 import 的 callback 需要被替换。
     """
-    results = []
-    deadline = time.time() + timeout_s
-    read_count = 0
+    import ailab.inference_wrapper.diffusers.video_diffusion.wrapper as wrapper_module
+    wrapper_module.callback = collector.on_callback
 
-    while time.time() < deadline:
-        rs = wrapper.wrapperRead(handle)
-        read_count += 1
 
-        if not isinstance(rs, Response):
-            print(f"[READ #{read_count}] invalid response type: {type(rs)}")
-            time.sleep(read_interval_s)
+def parse_callback_result(collector: CallbackResultCollector) -> dict:
+    """解析 callback 返回的 Response，提取 raw_resp 和 usage"""
+    result = {
+        "success": False,
+        "video_info": None,
+        "usage": None,
+        "error_code": collector.error_code,
+    }
+
+    if not collector.result or not collector.result.list:
+        return result
+
+    for item in collector.result.list:
+        if not hasattr(item, 'data') or not item.data:
+            continue
+        try:
+            data = item.data if isinstance(item.data, bytes) else item.data.encode("utf-8")
+            content = json.loads(data.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
             continue
 
-        for item in rs.list:
-            status_name = {DataBegin: "Begin", DataContinue: "Continue", DataEnd: "End"}.get(
-                item.status, str(item.status)
-            )
+        key = getattr(item, 'key', '')
+        if key == "raw_resp":
+            result["video_info"] = content
+            result["success"] = True
+        elif key == "usage":
+            result["usage"] = content
 
-            # 解析数据内容
-            content = None
-            if item.data:
-                try:
-                    content = json.loads(item.data.decode("utf-8"))
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    content = f"<binary: {len(item.data)} bytes>"
-
-            result = {
-                "key": item.key,
-                "status": item.status,
-                "status_name": status_name,
-                "content": content,
-            }
-            results.append(result)
-
-            # 打印状态
-            if item.status == DataBegin:
-                print(f"[READ #{read_count}] key={item.key}, status={status_name}, content={json.dumps(content, ensure_ascii=False)[:200] if isinstance(content, dict) else content}")
-            elif item.status == DataEnd:
-                print(f"[READ #{read_count}] key={item.key}, status={status_name}, content={json.dumps(content, ensure_ascii=False)[:300] if isinstance(content, dict) else content}")
-                return True, results
-            else:
-                # DataContinue: 简洁打印状态
-                task_status = content.get("status", "?") if isinstance(content, dict) else "?"
-                task_id = content.get("id", "?") if isinstance(content, dict) else "?"
-                progress = content.get("progress", "?") if isinstance(content, dict) else "?"
-                print(f"[READ #{read_count}] key={item.key}, status={status_name}, task_id={task_id}, task_status={task_status}, progress={progress}")
-
-        time.sleep(read_interval_s)
-
-    print(f"[READ] timeout after {timeout_s}s, {read_count} reads")
-    return False, results
+    return result
 
 
 def test_t2v(wrapper, args):
-    """测试 T2V (Text-to-Video)"""
+    """测试 T2V (Text-to-Video) — wrapperOnceExecAsync + callback"""
     print("\n" + "=" * 60)
     print(" T2V (Text-to-Video) Test")
     print("=" * 60)
@@ -308,62 +305,62 @@ def test_t2v(wrapper, args):
     raw_req = build_raw_req(args)
     print(f"raw_req: {json.dumps(raw_req, ensure_ascii=False)[:300]}")
 
-    # 1. 创建会话
-    print("\n[1] Creating session...")
-    session = wrapper.wrapperCreate({}, sid="test_t2v_session", usrTag="test_t2v")
-    handle = session.handle
-    print(f"    Handle: {handle}")
+    # 构建 reqData
+    req_data = build_req_data(raw_req)
 
-    try:
-        # 2. 写入 raw_req 请求
-        print("\n[2] Writing raw_req request...")
-        ret = write_raw_req_stream(wrapper, handle, raw_req)
-        print(f"    wrapperWrite returned: {ret}")
+    # 设置 callback 收集器
+    collector = CallbackResultCollector()
+    monkey_patch_callback(collector)
 
-        if ret != 0:
-            print(f"[ERROR] wrapperWrite failed with code: {ret}")
-            return False
+    # 提交异步请求
+    print("\n[1] Calling wrapperOnceExecAsync...")
+    start_time = time.time()
+    usr_tag = "test_t2v_tag"
+    ret = wrapper.wrapperOnceExecAsync({}, req_data, usr_tag)
+    print(f"    wrapperOnceExecAsync returned: {ret}")
 
-        # 3. 轮询读取结果
-        print(f"\n[3] Polling wrapperRead (interval={args.read_interval}s, timeout={args.timeout}s)...")
-        start_time = time.time()
+    if ret != 0:
+        print(f"[ERROR] wrapperOnceExecAsync failed with code: {ret}")
+        return False
 
-        success, results = poll_wrapper_read(
-            wrapper, handle,
-            timeout_s=args.timeout + 60,
-            read_interval_s=args.read_interval,
-        )
+    # 等待 callback 返回
+    print(f"\n[2] Waiting for callback (timeout={args.timeout}s)...")
+    got_result = collector.wait(timeout_s=args.timeout)
+    elapsed = time.time() - start_time
 
-        elapsed = time.time() - start_time
-        print(f"\n    Completed in {elapsed:.1f}s")
+    if not got_result:
+        print(f"[ERROR] Callback timeout after {args.timeout}s")
+        return False
 
-        # 4. 汇总结果
-        print("\n[4] Result summary:")
-        video_url = None
-        for r in results:
-            if r["status"] == DataEnd and isinstance(r.get("content"), dict):
-                video_url = r["content"].get("url")
+    print(f"    Callback received in {elapsed:.1f}s")
 
-            print(f"    - {r['key']}: {r['status_name']}", end="")
-            if isinstance(r.get("content"), dict):
-                print(f"  {json.dumps(r['content'], ensure_ascii=False)[:200]}")
-            else:
-                print()
+    # 解析结果
+    print("\n[3] Result summary:")
+    result = parse_callback_result(collector)
 
+    if not result["success"]:
+        print(f"    [FAILED] error_code={result['error_code']}")
+        return False
+
+    video_info = result["video_info"]
+    usage = result["usage"]
+
+    if video_info:
+        print(f"    video_info: {json.dumps(video_info, ensure_ascii=False)[:500]}")
+        video_url = video_info.get("url")
         if video_url:
-            print(f"\n[5] Video URL: {video_url}")
+            print(f"\n[4] Video URL: {video_url}")
         else:
-            print("\n[5] No video URL in result")
+            print("\n[4] No video URL in result (check video_info above)")
 
-        return success
+    if usage:
+        print(f"    usage: {json.dumps(usage, ensure_ascii=False)}")
 
-    finally:
-        print("\n[CLEANUP] Destroying session...")
-        wrapper.wrapperDestroy(handle)
+    return True
 
 
 def test_i2v(wrapper, args):
-    """测试 I2V (Image-to-Video)"""
+    """测试 I2V (Image-to-Video) — wrapperOnceExecAsync + callback"""
     print("\n" + "=" * 60)
     print(" I2V (Image-to-Video) Test")
     print("=" * 60)
@@ -391,63 +388,63 @@ def test_i2v(wrapper, args):
                for k, v in raw_req.items()}
     print(f"raw_req: {json.dumps(log_req, ensure_ascii=False)[:300]}")
 
-    # 1. 创建会话
-    print("\n[1] Creating session...")
-    session = wrapper.wrapperCreate({}, sid="test_i2v_session", usrTag="test_i2v")
-    handle = session.handle
-    print(f"    Handle: {handle}")
+    # 构建 reqData
+    req_data = build_req_data(raw_req)
 
-    try:
-        # 2. 写入 raw_req 请求
-        print("\n[2] Writing raw_req request...")
-        ret = write_raw_req_stream(wrapper, handle, raw_req)
-        print(f"    wrapperWrite returned: {ret}")
+    # 设置 callback 收集器
+    collector = CallbackResultCollector()
+    monkey_patch_callback(collector)
 
-        if ret != 0:
-            print(f"[ERROR] wrapperWrite failed with code: {ret}")
-            return False
+    # 提交异步请求
+    print("\n[1] Calling wrapperOnceExecAsync...")
+    start_time = time.time()
+    usr_tag = "test_i2v_tag"
+    ret = wrapper.wrapperOnceExecAsync({}, req_data, usr_tag)
+    print(f"    wrapperOnceExecAsync returned: {ret}")
 
-        # 3. 轮询读取结果
-        print(f"\n[3] Polling wrapperRead (interval={args.read_interval}s, timeout={args.timeout}s)...")
-        start_time = time.time()
+    if ret != 0:
+        print(f"[ERROR] wrapperOnceExecAsync failed with code: {ret}")
+        return False
 
-        success, results = poll_wrapper_read(
-            wrapper, handle,
-            timeout_s=args.timeout + 60,
-            read_interval_s=args.read_interval,
-        )
+    # 等待 callback 返回
+    print(f"\n[2] Waiting for callback (timeout={args.timeout}s)...")
+    got_result = collector.wait(timeout_s=args.timeout)
+    elapsed = time.time() - start_time
 
-        elapsed = time.time() - start_time
-        print(f"\n    Completed in {elapsed:.1f}s")
+    if not got_result:
+        print(f"[ERROR] Callback timeout after {args.timeout}s")
+        return False
 
-        # 4. 汇总结果
-        print("\n[4] Result summary:")
-        video_url = None
-        for r in results:
-            if r["status"] == DataEnd and isinstance(r.get("content"), dict):
-                video_url = r["content"].get("url")
+    print(f"    Callback received in {elapsed:.1f}s")
 
-            print(f"    - {r['key']}: {r['status_name']}", end="")
-            if isinstance(r.get("content"), dict):
-                print(f"  {json.dumps(r['content'], ensure_ascii=False)[:200]}")
-            else:
-                print()
+    # 解析结果
+    print("\n[3] Result summary:")
+    result = parse_callback_result(collector)
 
+    if not result["success"]:
+        print(f"    [FAILED] error_code={result['error_code']}")
+        return False
+
+    video_info = result["video_info"]
+    usage = result["usage"]
+
+    if video_info:
+        print(f"    video_info: {json.dumps(video_info, ensure_ascii=False)[:500]}")
+        video_url = video_info.get("url")
         if video_url:
-            print(f"\n[5] Video URL: {video_url}")
+            print(f"\n[4] Video URL: {video_url}")
         else:
-            print("\n[5] No video URL in result")
+            print("\n[4] No video URL in result (check video_info above)")
 
-        return success
+    if usage:
+        print(f"    usage: {json.dumps(usage, ensure_ascii=False)}")
 
-    finally:
-        print("\n[CLEANUP] Destroying session...")
-        wrapper.wrapperDestroy(handle)
+    return True
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="sglang diffusion video wrapper plugin test (wrapperRead mode)",
+        description="sglang diffusion video wrapper plugin test (wrapperOnceExecAsync + callback mode)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -456,7 +453,7 @@ Examples:
 
   # T2V 测试 (命令行覆盖)
   python test_wrapper_plugin.py --mode t2v --config config_t2v.json \\
-      --model-path /path/to/model --pretrained-name wan2.2-t2v-14b
+      --model-path /path/to/model --model-name wan2.2-t2v-14b
 
   # I2V 测试 (使用图片 URL)
   python test_wrapper_plugin.py --mode i2v --config config_i2v.json \\
@@ -480,9 +477,9 @@ Examples:
     parser.add_argument("--model-path", default=None,
                         help=f"Model path (overrides FULL_MODEL_PATH env, default: {DEFAULT_MODEL_PATH})")
     parser.add_argument("--pretrained-name", default=None,
-                        help="Model name (deprecated, use --model-name instead): wan2.2-t2v-14b, wan2.2-i2v-14b, wan2.1-t2v-1.3b")
+                        help="Model name (deprecated, use --model-name instead)")
     parser.add_argument("--model-name", default=None,
-                        help="Model name for wrapperInit config.modelName (overrides --pretrained-name)")
+                        help="Model name for wrapperInit config.modelName")
     parser.add_argument("--extra-args", default="",
                         help="Extra sglang serve args (e.g., '--num-gpus 1')")
 
@@ -521,12 +518,10 @@ Examples:
                         help="Video frames per second")
 
     # 超时配置
-    parser.add_argument("--poll-interval", type=int, default=DEFAULT_POLL_INTERVAL_MS,
-                        help=f"Poll interval in ms (default: {DEFAULT_POLL_INTERVAL_MS})")
-    parser.add_argument("--timeout", type=int, default=DEFAULT_POLL_TIMEOUT_S,
-                        help=f"Timeout in seconds (default: {DEFAULT_POLL_TIMEOUT_S})")
-    parser.add_argument("--read-interval", type=int, default=DEFAULT_READ_INTERVAL_S,
-                        help=f"wrapperRead polling interval in seconds (default: {DEFAULT_READ_INTERVAL_S})")
+    parser.add_argument("--poll-interval", type=int, default=None,
+                        help="Poll interval in ms (passed to config as pollIntervalMs)")
+    parser.add_argument("--timeout", type=int, default=DEFAULT_CALLBACK_TIMEOUT_S,
+                        help=f"Callback wait timeout in seconds (default: {DEFAULT_CALLBACK_TIMEOUT_S})")
 
     # 日志配置
     parser.add_argument("--log-level", default="INFO",
@@ -571,7 +566,7 @@ Examples:
     wrapper = Wrapper()
     print("[INIT] Wrapper instance created")
 
-    # 初始化 wrapper —— 传入 config
+    # 初始化 wrapper
     print(f"\n[INIT] Initializing wrapper with config: {json.dumps(config, ensure_ascii=False)[:300]}...")
     print("[INIT] (this may take a while to start sglang serve)")
     start_time = time.time()
