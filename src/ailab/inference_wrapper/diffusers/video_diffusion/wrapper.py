@@ -6,7 +6,6 @@ import json
 import threading
 import asyncio
 import queue
-import enum
 import uuid
 import subprocess
 import socket
@@ -130,6 +129,28 @@ def _normalize_reference_url(reference_url: str, filelogger) -> str:
     filelogger.info("reference_url is raw base64, prepended data:image/png;base64, prefix")
     return f"data:image/png;base64,{reference_url}"
 
+def _parse_raw_req(reqData: DataListCls, filelogger) -> dict:
+    """从 reqData 中解析 raw_req JSON 字段"""
+    raw_req_node = reqData.get("raw_req")
+    if not raw_req_node:
+        return {}
+    raw_req_data = raw_req_node.data
+    if isinstance(raw_req_data, bytes):
+        raw_req_data = raw_req_data.decode("utf-8")
+    try:
+        parsed = json.loads(raw_req_data)
+        if isinstance(parsed, str):
+            filelogger.warning("raw_req is double-encoded JSON, parsing again")
+            parsed = json.loads(parsed)
+        if not isinstance(parsed, dict):
+            filelogger.error(f"raw_req is not a dict, got {type(parsed).__name__}")
+            return {}
+        return parsed
+    except Exception as e:
+        filelogger.error(f"Failed to parse raw_req JSON: {e}")
+        return {}
+
+
 def resp_content(status, output_json: dict):
     resd = ResponseData()
     resd.key = "raw_resp"
@@ -139,10 +160,45 @@ def resp_content(status, output_json: dict):
     return resd
 
 
-class RequestMode(enum.Enum):
-    ONCE = "once"
-    ONCE_ASYNC = "once_async"
-    STREAM = "stream"
+def resp_usage(status, usage_json: dict):
+    resd = ResponseData()
+    resd.key = "usage"
+    resd.setDataType(DataText)
+    resd.status = status
+    resd.setData(json.dumps(usage_json, ensure_ascii=False).encode("utf-8"))
+    return resd
+
+
+def _calc_usage(prompt: str, size: str, seconds, fps, steps) -> dict:
+    """
+    计算 usage token 信息:
+    - prompt_tokens = len(prompt)
+    - completion_tokens = width * height * seconds * fps * num_inference_steps / 1024 / 30
+    """
+    prompt_tokens = (len(prompt) * 56) // 100 if prompt else 4
+
+    try:
+        w, h = size.split("x")
+        width, height = int(w), int(h)
+    except (ValueError, AttributeError):
+        width, height = 1280, 720
+
+    # seconds/fps 默认值
+    sec = int(seconds) if seconds is not None and seconds != "" else 4
+    frame_rate = int(fps) if fps is not None and fps != "" else 24
+    steps = int(steps) if steps is not None and steps != "" else 50
+
+    completion_tokens = int(width * height * sec * frame_rate * steps / 1024 / 30)
+    total_tokens = prompt_tokens + completion_tokens
+
+    return {
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": total_tokens,
+    }
+
+
+# ---------- data classes ----------
 
 class RequestInfo:
     def __init__(self, sid: str, params: dict, user_tag: str = ""):
@@ -150,31 +206,19 @@ class RequestInfo:
         self.sid = sid
         self.user_tag = user_tag
         self.params = params
-        self.requests = []
-        self.raw_req_chunks = []        # raw_req 分片缓存
         self.raw_req = None             # 解析后的 raw_req dict
-        self.stop_event = threading.Event()  # 取消信号（替代 stop_q + cancelled）
-        self.finished_event = threading.Event()  # 任务已进入终态
-        self.end_sent_event = threading.Event()  # 已发送 DataEnd（防止重复）
-        self._end_sent_lock = threading.Lock()  # _send_end_response 原子化锁
-        self.out_q = queue.Queue(maxsize=10)  # 有限大小，防止内存膨胀
-        self._destroy_pending = False  # wrapperDestroy 已调用，待清理
-        self.task_status = "idle"  # idle / queued / processing / completed / failed
 
 class PromptInferenceInfo:
     def __init__(self, wrapper,
-                 thread_id: str,
-                 mode: RequestMode,
                  prompt: str,
-                 requestInfo: RequestInfo,
-                 result_q: queue.Queue = None):
+                 requestInfo: RequestInfo):
         self.wrapper = wrapper
         self.requestInfo = requestInfo
-        self.thread_id = thread_id
-        self.mode = mode
         self.prompt = prompt
         self.request_id = str(uuid.uuid4().hex)
-        self.result_q = result_q
+
+
+# ---------- thread pool ----------
 
 class ThreadPool:
     def __init__(self, num_threads, wrapper):
@@ -232,7 +276,9 @@ class ThreadPool:
         for thread in self.threads.values():
             thread.join()
 
-# 定义服务推理逻辑
+
+# ---------- wrapper ----------
+
 class Wrapper(WrapperBase):
     version = "v1"
     model = None
@@ -247,8 +293,6 @@ class Wrapper(WrapperBase):
         self.model_name: str = None
         self.task_type: str = None
         self.thread_pool: ThreadPool = None
-        self.request_map: dict[str, RequestInfo] = {}
-        self.request_map_lock: threading.Lock = threading.Lock()
         self.thread_pool_size: int = 1
         self.supported_resolutions: dict = {}
 
@@ -264,7 +308,7 @@ class Wrapper(WrapperBase):
                 os.environ['SGLANG_S3_SECRET_ACCESS_KEY'] = config.get("sglS3SecretKey", "")
                 os.environ['SGLANG_S3_ACCESS_KEY_ID'] = config.get("sglS3AccessKey", "")
                 os.environ['POLL_INTERVAL_MS'] = config.get("pollIntervalMs", "5000")
-                
+
                 self.model_name = config.get("modelName", "")
                 self.task_type = config.get("modelTaskType", "t2v")
                 supported_resolutions = config.get("supportedResolutions", {})
@@ -290,7 +334,7 @@ class Wrapper(WrapperBase):
             if not self.task_type or self.task_type not in TASK_TYPE_CONFIGS:
                 self.filelogger.error(f"Unsupported task_type: {self.task_type}, currently only support {TASK_TYPE_CONFIGS}")
                 return -1
-            
+
             if not self.supported_resolutions:
                 self.filelogger.error(f"supportedResolutions is not set in config.")
                 return -1
@@ -319,239 +363,59 @@ class Wrapper(WrapperBase):
             self.filelogger.error(f"WrapperInit error: {e}")
             return -1
 
-    def wrapperCreate(self, params: {}, sid: str, persId: int = 0, usrTag: str = "") -> SessionCreateResponse:
-        self.filelogger.info(f"start wrapperCreate {params}")
-        requestInfo = RequestInfo(sid, params, usrTag)
-        with self.request_map_lock:
-            self.request_map[requestInfo.handle] = requestInfo
-
-        s = SessionCreateResponse()
-        s.handle = requestInfo.handle
-        s.error_code = 0
-        self.filelogger.debug(f"success wrapperCreate, handle: {s.handle}, params: {params}")
-        return s
-
-    def wrapperWrite(self, handle: str, reqData: DataListCls) -> int:
-        self.filelogger.debug(f"start wrapperWrite, handle: {handle}, reqData: {reqData}")
+    def wrapperOnceExecAsync(self, params: Dict, reqData: DataListCls, usrTag: str = "9527", persId: int = 0) -> int:
+        """非流式异步接口：接收请求后立即返回，视频生成完成后通过 callback 返回结果"""
         try:
-            with self.request_map_lock:
-                requestInfo = self.request_map.get(handle)
-                if not requestInfo:
-                    self.filelogger.error(f"handle not found: {handle}")
-                    return -1
-
-            # --- raw_req 流式接收 ---
-            raw_req_node = reqData.get("raw_req")
-            if raw_req_node:
-                raw_req_data = raw_req_node.data
-                raw_req_status = raw_req_node.status
-
-                # 缓存本次收到的 raw_req 分片
-                # aiges 框架保证同一 handle 的 wrapperWrite 串行调用，无需加锁
-                # data 可能是 str 或 bytes，统一转为 str
-                if isinstance(raw_req_data, bytes):
-                    raw_req_data = raw_req_data.decode("utf-8")
-                self.filelogger.debug(f"raw_req_data: {raw_req_data}")
-                requestInfo.raw_req_chunks.append(raw_req_data)
-
-                # raw_req 尚未传输完毕，仅缓存
-                if raw_req_status != DataEnd:
-                    self.filelogger.debug(
-                        f"raw_req chunk received, status={raw_req_status}, "
-                        f"accumulated chunks={len(requestInfo.raw_req_chunks)}, handle: {handle}")
-                    return 0
-
-                # DataEnd: raw_req 传输完毕，拼合并解析 JSON
-                raw_req_str = ''.join(requestInfo.raw_req_chunks)
-                requestInfo.raw_req_chunks.clear()
-                self.filelogger.debug(f"raw_req_str: {raw_req_str[:500]}, handle: {handle}")
-                try:
-                    parsed = json.loads(raw_req_str)
-                    # 处理双重 JSON 编码：如果解析结果仍是字符串，再解析一次
-                    if isinstance(parsed, str):
-                        self.filelogger.warning(f"raw_req is double-encoded JSON, parsing again, handle: {handle}")
-                        parsed = json.loads(parsed)
-                    requestInfo.raw_req = parsed
-                    self.filelogger.info(f"raw_req parsed successfully, handle: {handle}")
-                    if not isinstance(requestInfo.raw_req, dict):
-                        self.filelogger.error(f"raw_req is not a dict, got {type(requestInfo.raw_req).__name__}: {str(requestInfo.raw_req)[:200]}, handle: {handle}")
-                        requestInfo.task_status = "failed"
-                        self._send_end_response(requestInfo, {"status": "failed", "error": f"raw_req is not a dict, got {type(requestInfo.raw_req).__name__}"})
-                        return -1
-                except Exception as e:
-                    self.filelogger.error(f"Failed to parse raw_req JSON: {e}")
-                    requestInfo.task_status = "failed"
-                    self._send_end_response(requestInfo, {"status": "failed", "error": f"Failed to parse raw_req JSON: {e}"})
-                    return -1
-            else:
-                # 非 raw_req 帧，跳过（数据尚未到达）
-                self.filelogger.debug(f"wrapperWrite: no raw_req node in this frame, handle: {handle}")
-                return 0
-
-            # 校验 raw_req
-            prompt = requestInfo.raw_req.get("prompt")
-            if not prompt:
-                self.filelogger.error("prompt is required in raw_req")
-                requestInfo.task_status = "failed"
-                self._send_end_response(requestInfo, {"status": "failed", "error": "prompt is required in raw_req"})
+            # 解析 raw_req
+            raw_req = _parse_raw_req(reqData, self.filelogger)
+            if not raw_req:
+                self.filelogger.error("raw_req is empty or invalid")
+                res = Response()
+                res = res.response_err(ERROR_INVALID_PARAMS)
+                callback(res, usrTag)
                 return -1
 
-            thread_id = self.thread_pool.alloc_min_thread()
-            inferenceInfo = PromptInferenceInfo(self, thread_id, RequestMode.STREAM, prompt, requestInfo)
+            prompt = raw_req.get("prompt")
+            if not prompt:
+                self.filelogger.error("prompt is required in raw_req")
+                res = Response()
+                res = res.response_err(ERROR_INVALID_PARAMS)
+                callback(res, usrTag)
+                return -1
 
-            # 先修改 requestInfo 内部字段，再投递任务（保证可见性）
-            requestInfo.handle = handle
-            requestInfo.requests.append(inferenceInfo.request_id)
+            requestInfo = RequestInfo("", params, usrTag)
+            requestInfo.raw_req = raw_req
+
+            thread_id = self.thread_pool.alloc_min_thread()
+            inferenceInfo = PromptInferenceInfo(self, prompt, requestInfo)
 
             self.thread_pool.put_task(thread_id, inferenceInfo)
 
-            self.filelogger.debug(
-                f"success wrapperWrite handle:{handle}, thread_id:{thread_id},request_id:{inferenceInfo.request_id}")
+            self.filelogger.info(f"wrapperOnceExecAsync queued, request_id:{inferenceInfo.request_id}, usrTag:{usrTag}")
             return 0
 
         except Exception as e:
             import traceback
             traceback.print_exc()
-            self.filelogger.error(f"wrapperWrite failed: {e}")
+            self.filelogger.error(f"wrapperOnceExecAsync failed: {e}")
+            res = Response()
+            res = res.response_err(ERROR_DOWNSTREAM_FAILED)
+            callback(res, usrTag)
             return -1
 
-    def wrapperRead(self, handle: str) -> Response:
-        """
-        同步读取结果, 对应 aiges 配置 asyncMode = false
-        阻塞等待 out_q 数据: 有结果立即返回, 60s 超时返回异常
-        """
-        # time.sleep(5)
-        with self.request_map_lock:
-            requestInfo = self.request_map.get(handle)
-        if not requestInfo:
-            self.filelogger.error(f"wrapperRead handle not found: {handle}")
-            r = Response()
-            r = r.response_err(ERROR_INVALID_PARAMS)
-            return r
-
-        # 检查是否已取消（wrapperDestroy 已调用）
-        if requestInfo.stop_event.is_set() and not requestInfo.end_sent_event.is_set():
-            # 发送 cancelled DataEnd 兜底
-            self._send_end_response(requestInfo, {"status": "cancelled", "error": "Session destroyed"})
-
-        # 阻塞等待最多 60s，等 out_q 有数据立即返回
-        try:
-            rs = requestInfo.out_q.get(timeout=60)
-        except queue.Empty:
-            # 60s 超时无数据，返回超时异常
-            self.filelogger.error(f"wrapperRead 60s timeout, handle: {handle}")
-            r = Response()
-            r = r.response_err(ERROR_POLL_TIMEOUT)
-            return r
-
-        if not isinstance(rs, Response):
-            self.filelogger.error(f"wrapperRead invalid response type: {type(rs)}")
-            r = Response()
-            r = r.response_err(ERROR_DOWNSTREAM_FAILED)
-            return r
-
-        # DataEnd 表示本次会话结果读取完毕，清理 request_map
-        is_end = any(rd.status == DataEnd for rd in rs.list) if rs.list else False
-        if is_end:
-            self.filelogger.info(f"wrapperRead session done, handle: {handle}")
-            with self.request_map_lock:
-                self.request_map.pop(handle, None)
-
-        return rs
-
-    def wrapperDestroy(self, handle: str) -> int:
-        self.filelogger.debug(f"start wrapperDestroy, handle: {handle}")
-        with self.request_map_lock:
-            ri = self.request_map.get(handle)
-            if ri is None:
-                # handle 已被 wrapperRead 在 DataEnd 后清理，会话正常结束
-                self.filelogger.info(f"wrapperDestroy: handle already cleaned up, handle: {handle}")
-                return 0
-            # 软取消：通知 worker 停止
-            ri.stop_event.set()
-            ri._destroy_pending = True
-            # 如果 worker 已完成，直接删除；否则保留给 wrapperRead 兜底
-            if ri.finished_event.is_set():
-                del self.request_map[handle]
-                self.filelogger.info(f"wrapperDestroy, worker already finished, handle: {handle}")
-        self.filelogger.info(f"success wrapperDestroy, handle: {handle}")
-        return 0
-
-
-    def wrapperOnceExecAsync(self, params: Dict, reqData: DataListCls, usrTag: str = "9527", persId: int = 0):
-        pass
-
-    def wrapperOnceExec(self, params: Dict, reqData: DataListCls, usrTag: str = "", persId: int = 0) -> Response:
-        pass
-
-    def _response_err(self, error_code: int, message: str = "") -> Response:
-        """创建错误响应"""
-        res = Response()
-        res = res.response_err(error_code)
-        return res
-
-    def _send_response(self, res: Response, requestInfo: RequestInfo):
-        """推送到 out_q 供 wrapperRead 同步读取，队列满时丢弃旧进度数据"""
-        try:
-            requestInfo.out_q.put_nowait(res)
-        except queue.Full:
-            # 队列满：丢弃最旧的 DataContinue 进度数据，保留 DataBegin/DataEnd
-            for _ in range(requestInfo.out_q.qsize() + 1):
-                try:
-                    old = requestInfo.out_q.get_nowait()
-                    # 如果是终态数据，重新放回
-                    if isinstance(old, Response) and old.list and any(rd.status == DataEnd for rd in old.list):
-                        try:
-                            requestInfo.out_q.put_nowait(old)
-                        except queue.Full:
-                            self.filelogger.error(f"out_q full when putting back DataEnd, handle: {requestInfo.handle}")
-                except queue.Empty:
-                    break
-            try:
-                requestInfo.out_q.put_nowait(res)
-            except queue.Full:
-                self.filelogger.warning(f"out_q still full after drain, dropping response for handle: {requestInfo.handle}")
-
-    def _send_end_response(self, requestInfo: RequestInfo, video_info: dict):
-        """发送 DataEnd 终态响应，保证只发一次（原子化 check-and-set）"""
-        # end_sent_event 初始为 False，set() 返回 True 表示由本线程设置
-        # 如果已经是 True，说明其他线程已发送过，直接返回
-        if not requestInfo._end_sent_lock.acquire(blocking=False):
-            # 另一个线程正在发送，等待其完成后返回
-            requestInfo._end_sent_lock.acquire()
-            requestInfo._end_sent_lock.release()
-            return
-        try:
-            if requestInfo.end_sent_event.is_set():
-                return
-            requestInfo.end_sent_event.set()
-            requestInfo.finished_event.set()
-            res = Response()
-            content = resp_content(DataEnd, video_info)
-            res.list = [content]
-            self._send_response(res, requestInfo)
-        finally:
-            requestInfo._end_sent_lock.release()
-
     async def create_video_task(self, inferenceInfo: PromptInferenceInfo):
+        """线程池 worker：调用 sglang videos API，完成后通过 callback 返回"""
         requestInfo = inferenceInfo.requestInfo
         request_id = inferenceInfo.request_id
         user_tag = requestInfo.user_tag
-        sid = requestInfo.sid
 
         try:
-            # 检查是否已取消
-            if requestInfo.stop_event.is_set():
-                self.filelogger.info(f"====>inference abort before infer, {request_id}")
-                requestInfo.task_status = "failed"
-                self._send_end_response(requestInfo, {"status": "failed", "error": "Task aborted"})
-                return
-
             raw_req = requestInfo.raw_req
             if not isinstance(raw_req, dict):
                 self.filelogger.error(f"raw_req is not dict, type={type(raw_req).__name__}, value={str(raw_req)[:200]}")
-                requestInfo.task_status = "failed"
-                self._send_end_response(requestInfo, {"status": "failed", "error": f"raw_req is not a dict, got {type(raw_req).__name__}"})
+                res = Response()
+                res = res.response_err(ERROR_INVALID_PARAMS)
+                callback(res, user_tag)
                 return
             prompt = inferenceInfo.prompt
 
@@ -594,98 +458,73 @@ class Wrapper(WrapperBase):
             for res in model_resolutions:
                 supported_sizes.update(RESOLUTIONS_TOSIZE.get(res, []))
 
-            if size not in supported_sizes:
+            if supported_sizes and size not in supported_sizes:
                 ori_size = size
                 size = "1280x720" if self.model_name not in ["wan2.1-t2v-1.3b"] else "832x480"
                 self.filelogger.warning(f"{self.model_name} unsupported size {ori_size}, use {size} instead.")
 
+            # 构建 API 请求参数
+            req_params = {
+                "model": self.model_name,
+                "prompt": prompt,
+                "size": size,
+            }
+
+            extra_body = {}
+            if negative_prompt:
+                extra_body["negative_prompt"] = negative_prompt
+            if seed is not None:
+                extra_body["seed"] = seed
+            if num_inference_steps is not None:
+                extra_body["num_inference_steps"] = num_inference_steps
+            if guidance_scale is not None:
+                extra_body["guidance_scale"] = guidance_scale
+            if fps is not None:
+                extra_body["fps"] = fps
+
+            if seconds is not None:
+                req_params["seconds"] = seconds
+            req_params["extra_body"] = extra_body
+
+            # I2V 需要传入图片
+            if self.task_type == "i2v":
+                if not reference_url:
+                    self.filelogger.error("i2v task requires reference_url in raw_req")
+                    res = Response()
+                    res = res.response_err(ERROR_INVALID_PARAMS)
+                    callback(res, user_tag)
+                    return
+                extra_body["reference_url"] = reference_url
+
             self.filelogger.info(f"Creating video generation task, prompt: {prompt[:100]}...")
-            requestInfo.task_status = "queued"
-            try:
-                req_params = {
-                    "model": self.model_name,
-                    "prompt": prompt,
-                    "size": size,
-                }
+            self.filelogger.debug(f"video task params: {str(req_params)[:1000]}")
+            rsp = await asyncio.to_thread(self.client.videos.create, **req_params)
 
-                extra_body = {}
-                if negative_prompt:
-                    extra_body["negative_prompt"] = negative_prompt
-                if seed is not None:
-                    extra_body["seed"] = seed
-                if num_inference_steps is not None:
-                    extra_body["num_inference_steps"] = num_inference_steps
-                if guidance_scale is not None:
-                    extra_body["guidance_scale"] = guidance_scale
-                if fps is not None:
-                    extra_body["fps"] = fps
+            if rsp.status == "failed":
+                self.filelogger.error(f"Failed to create task, request_id:{request_id}, task_id:{rsp.id}")
+                res = Response()
+                res = res.response_err(ERROR_DOWNSTREAM_FAILED)
+                callback(res, user_tag)
+                return
 
-                if seconds is not None:
-                    req_params["seconds"] = seconds
-                req_params["extra_body"] = extra_body
+            task_id = rsp.id
+            self.filelogger.info(f"Video task created, task_id: {task_id}")
 
-                # I2V 需要传入图片
-                if self.task_type == "i2v":
-                    if not reference_url:
-                        self.filelogger.error("i2v task requires reference_url in raw_req")
-                        requestInfo.task_status = "failed"
-                        self._send_end_response(requestInfo, {"status": "failed", "error": "i2v task requires reference_url in raw_req"})
-                        return
-                    extra_body["reference_url"] = reference_url
-
-                # 再次检查取消
-                if requestInfo.stop_event.is_set():
-                    self.filelogger.info(f"Task cancelled before API call, {request_id}")
-                    requestInfo.task_status = "failed"
-                    self._send_end_response(requestInfo, {"status": "failed", "error": "Task cancelled"})
-                    return
-
-                self.filelogger.debug(f"video task params: {str(req_params)[:1000]}")
-                rsp = await asyncio.to_thread(self.client.videos.create, **req_params)
-
-                if rsp.status == "failed":
-                    self.filelogger.error(
-                        f"Failed to create task, ase_sid:{sid}, ase_request_id:{request_id}, request_id:{rsp.id}."
-                    )
-                    requestInfo.task_status = "failed"
-                    self._send_end_response(requestInfo, {"status": "failed", "error": "Failed to create video task"})
-                    return
-
-                task_id = rsp.id
-                requestInfo.task_status = rsp.status
-                self.filelogger.info(f"Video task created, task_id: {task_id}")
-
-                # 发送 DataBegin 状态
-                res_begin = Response()
-                video_info = {"request_id": request_id}
-                video_info.update(rsp.model_dump())
-                content = resp_content(DataBegin, video_info)
-                res_begin.list = [content]
-                self._send_response(res_begin, requestInfo)
-
-                # 轮询获取结果（终态已由 poll 内部通过 _send_end_response 发送）
-                await self.poll_video_task_async(task_id, sid, request_id, requestInfo)
-
-            except Exception as e:
-                import traceback
-                traceback.print_exc()
-                self.filelogger.error(f"An error occurred when infer: {e}, ret {ERROR_DOWNSTREAM_FAILED}")
-                requestInfo.task_status = "failed"
-                self._send_end_response(requestInfo, {"status": "failed", "error": str(e)})
+            # 轮询获取结果
+            await self.poll_video_task_async(task_id, request_id, requestInfo, prompt, size, seconds, fps, num_inference_steps)
 
         except Exception as e:
-            # 外层兜底：任何未预期的异常
             import traceback
             traceback.print_exc()
-            self.filelogger.error(f"Unexpected error in create_video_task: {e}", exc_info=True)
-            requestInfo.task_status = "failed"
-            self._send_end_response(requestInfo, {"status": "failed", "error": f"Unexpected error: {e}"})
+            self.filelogger.error(f"create_video_task failed: {e}")
+            res = Response()
+            res = res.response_err(ERROR_DOWNSTREAM_FAILED)
+            callback(res, user_tag)
 
-    async def poll_video_task_async(self, task_id: str, sid: str, request_id: str, requestInfo: RequestInfo) -> Response:
-        """
-        异步轮询视频任务状态，直到完成或超时
-        注意：此函数返回的 Response 由调用方(_send_response)发送，终态 DataEnd 由 _send_end_response 统一处理
-        """
+    async def poll_video_task_async(self, task_id: str, request_id: str, requestInfo: RequestInfo,
+                                       prompt: str, size: str, seconds, fps, steps):
+        """异步轮询视频任务状态，直到完成或超时，最终通过 callback 返回结果"""
+        user_tag = requestInfo.user_tag
         self.filelogger.info(f"Waiting video task result, task_id: {task_id}")
 
         poll_interval_ms = int(os.environ.get("POLL_INTERVAL_MS", "5000"))
@@ -694,63 +533,69 @@ class Wrapper(WrapperBase):
 
         last_status = None
         while True:
-            # 检查取消
-            if requestInfo.stop_event.is_set():
-                self.filelogger.info(f"Task cancelled during poll, task_id: {task_id}")
-                requestInfo.task_status = "failed"
-                self._send_end_response(requestInfo, {"status": "failed", "error": "Task cancelled"})
-                return None  # 已由 _send_end_response 发送终态
-
             # 检查超时
             if time.time() > deadline:
                 self.filelogger.error(f"Poll timeout for task_id: {task_id}")
-                requestInfo.task_status = "failed"
-                self._send_end_response(requestInfo, {"status": "failed", "error": f"Poll timeout after {poll_timeout_s}s"})
-                return None
+                res = Response()
+                res = res.response_err(ERROR_POLL_TIMEOUT)
+                callback(res, user_tag)
+                return
 
             try:
                 rsp = await asyncio.to_thread(self.client.videos.retrieve, video_id=task_id)
 
                 current_status = rsp.status
                 progress = getattr(rsp, 'progress', 0)
-                requestInfo.task_status = current_status
 
                 if current_status != last_status:
                     self.filelogger.info(f"Task {task_id} status: {current_status}, progress: {progress}")
                     last_status = current_status
 
                 if current_status == "completed" and str(progress) == "100":
-                    requestInfo.task_status = "completed"
-                    self.filelogger.info(f"Video generation completed, task_id: {task_id}, inference_time: {getattr(rsp, 'inference_time_s', None)}")
+                    self.filelogger.info(f"""Video generation completed, task_id: {task_id}, ase_request_id: {request_id}, task_status: {rsp.status},
+                                         video_url: {getattr(rsp, 'url', None)}, inference_time: {getattr(rsp, 'inference_time_s', None)}""")
 
                     video_info = {"request_id": request_id}
                     video_info.update(rsp.model_dump())
 
-                    self._send_end_response(requestInfo, video_info)
-                    return None  # 已由 _send_end_response 发送终态
+                    # 计算 usage
+                    usage_json = _calc_usage(prompt, size, seconds, fps, steps)
+
+                    # 构建返回 Response
+                    res = Response()
+                    content = resp_content(DataEnd, video_info)
+                    usage = resp_usage(DataEnd, usage_json)
+                    res.list = [content, usage]
+                    callback(res, user_tag)
+                    return
 
                 elif current_status == "failed":
-                    requestInfo.task_status = "failed"
                     error_msg = getattr(rsp, 'error', None) or "unknown"
                     self.filelogger.error(f"Video task failed, task_id: {task_id}, error: {error_msg}")
-                    self._send_end_response(requestInfo, {"status": "failed", "error": f"Video generation failed: {error_msg}"})
-                    return None
-
-                else:
-                    # 发送进度更新 DataContinue
-                    res_continue = Response()
-                    video_info = {"request_id": request_id}
-                    video_info.update(rsp.model_dump())
-
-                    content = resp_content(DataContinue, video_info)
-                    res_continue.list = [content]
-                    self._send_response(res_continue, requestInfo)
+                    res = Response()
+                    res = res.response_err(ERROR_DOWNSTREAM_FAILED)
+                    callback(res, user_tag)
+                    return
 
             except Exception as e:
                 self.filelogger.error(f"Error polling task {task_id}: {e}")
 
             await asyncio.sleep(poll_interval_ms / 1000.0)
 
+    def wrapperOnceExec(self, params: Dict, reqData: DataListCls, usrTag: str = "", persId: int = 0) -> Response:
+        pass
+
+    def wrapperCreate(self, params: {}, sid: str, persId: int = 0, usrTag: str = "") -> SessionCreateResponse:
+        pass
+
+    def wrapperWrite(self, handle: str, req: DataListCls) -> int:
+        pass
+
+    def wrapperDestroy(self, handle: str) -> int:
+        pass
+
+    def wrapperRead(self, handle: str):
+        pass
 
     def wrapperFini(self) -> int:
         if self.thread_pool is not None:

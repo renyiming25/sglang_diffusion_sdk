@@ -33,8 +33,8 @@ class Wrapper:
     def __init__(self, *args, **kwargs):
         pretrained_model = os.environ.get("PRETRAINED_MODEL_NAME")
         log.info(f"Wrapper init pretrained_model:{pretrained_model}")
-        if pretrained_model is None:
-            raise ValueError("pretrained_model env not set")
+        # if pretrained_model is None:
+        #     raise ValueError("pretrained_model env not set")
 
         model_task_type = os.environ.get("MODEL_TASK_TYPE", "image_generation")
         backend = os.environ.get("MAAS_BACKEND","sglang")
