@@ -17,9 +17,9 @@ from openai import OpenAI
 
 from aiges.core.types import *
 try:
-    from aiges_embed import ResponseData, Response, DataListNode, SessionCreateResponse, DataListCls, callback # c++
+    from aiges_embed import ResponseData, Response, DataListNode, SessionCreateResponse, DataListCls, callback, callback_metric, callback_metric_ex # c++
 except:
-    from aiges.dto import Response, ResponseData, DataListNode, SessionCreateResponse, DataListCls, callback
+    from aiges.dto import Response, ResponseData, DataListNode, SessionCreateResponse, DataListCls, callback, callback_metric, callback_metric_ex
 
 from aiges.sdk import WrapperBase
 from aiges.utils.log import getFileLogger
@@ -153,7 +153,7 @@ def _parse_raw_req(reqData: DataListCls, filelogger) -> dict:
 
 def resp_content(status, output_json: dict):
     resd = ResponseData()
-    resd.key = "raw_resp"
+    resd.key = "video"
     resd.setDataType(DataText)
     resd.status = status
     resd.setData(json.dumps(output_json, ensure_ascii=False).encode("utf-8"))
@@ -295,6 +295,9 @@ class Wrapper(WrapperBase):
         self.thread_pool: ThreadPool = None
         self.thread_pool_size: int = 1
         self.supported_resolutions: dict = {}
+        # 计量上下文
+        self.metric_appid: str = None
+        self.metric_channel: str = None  # serviceID
 
     def wrapperInit(self, config: Dict) -> int:
         self.filelogger.info("Initializing ...")
@@ -320,6 +323,10 @@ class Wrapper(WrapperBase):
                         supported_resolutions = {}
                 self.supported_resolutions = supported_resolutions
 
+                # 提取计量上下文: appid 和 channel(serviceID)
+                self.metric_appid = config.get("appID", os.environ.get("METRIC_APPID", "default"))
+                self.metric_channel = config.get("serviceID", os.environ.get("SERVICE_ID", "default"))
+
             # 使用环境变量 FULL_MODEL_PATH 作为模型路径
             self.base_model = os.environ.get("FULL_MODEL_PATH")
 
@@ -339,6 +346,9 @@ class Wrapper(WrapperBase):
                 self.filelogger.error(f"supportedResolutions is not set in config.")
                 return -1
             self.filelogger.info(f"base_model: {self.base_model}, model_name: {self.model_name}, task_type: {self.task_type}")
+
+            # 记录计量上下文
+            self.filelogger.info(f"Metric context: appID={self.metric_appid}, channel(serviceID)={self.metric_channel}, callback_metric_ex available: {callback_metric_ex is not None}")
 
             port = _get_free_port()
             self.server_port = port
@@ -460,7 +470,7 @@ class Wrapper(WrapperBase):
 
             if supported_sizes and size not in supported_sizes:
                 ori_size = size
-                size = "1280x720" if self.model_name not in ["wan2.1-t2v-1.3b"] else "832x480"
+                size = "832x480"
                 self.filelogger.warning(f"{self.model_name} unsupported size {ori_size}, use {size} instead.")
 
             # 构建 API 请求参数
@@ -561,6 +571,20 @@ class Wrapper(WrapperBase):
                     # 计算 usage
                     usage_json = _calc_usage(prompt, size, seconds, fps, steps)
 
+                    # 自定义计量
+                    try: 
+                        callback_metric_ex(user_tag, self.metric_appid, self.metric_channel, "tokens.total", usage_json["total_tokens"])
+                        callback_metric_ex(user_tag, self.metric_appid, self.metric_channel, f"{self.metric_channel}InTokens.total", usage_json["prompt_tokens"])
+                        callback_metric_ex(user_tag, self.metric_appid, self.metric_channel, f"{self.metric_channel}OutTokens.total", usage_json["completion_tokens"])
+
+                        channel_default = self.metric_channel + "_default"
+                        callback_metric_ex(user_tag, self.metric_appid, channel_default, "tokens.total", usage_json["total_tokens"])
+                        callback_metric_ex(user_tag, self.metric_appid, channel_default, f"{channel_default}InTokens.total", usage_json["prompt_tokens"])
+                        callback_metric_ex(user_tag, self.metric_appid, channel_default, f"{channel_default}OutTokens.total", usage_json["completion_tokens"])
+                    
+                    except Exception as e:
+                        self.filelogger.error(f"Failed to callback_metric, err: {e}")
+                    
                     # 构建返回 Response
                     res = Response()
                     content = resp_content(DataEnd, video_info)
