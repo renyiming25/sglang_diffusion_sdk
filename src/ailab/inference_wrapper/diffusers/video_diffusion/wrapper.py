@@ -571,17 +571,18 @@ class Wrapper(WrapperBase):
                     # 计算 usage
                     usage_json = _calc_usage(prompt, size, seconds, fps, steps)
 
-                    # 自定义计量
-                    try: 
-                        callback_metric_ex(user_tag, self.metric_appid, self.metric_channel, "tokens.total", usage_json["total_tokens"])
-                        callback_metric_ex(user_tag, self.metric_appid, self.metric_channel, f"{self.metric_channel}InTokens.total", usage_json["prompt_tokens"])
-                        callback_metric_ex(user_tag, self.metric_appid, self.metric_channel, f"{self.metric_channel}OutTokens.total", usage_json["completion_tokens"])
+                    # 自定义计量 - 从请求 params 中提取 app_id，回退到 init 配置
+                    req_appid = (requestInfo.params or {}).get("app_id") or self.metric_appid
+                    try:
+                        callback_metric_ex(user_tag, req_appid, self.metric_channel, "tokens.total", usage_json["total_tokens"])
+                        callback_metric_ex(user_tag, req_appid, self.metric_channel, f"{self.metric_channel}InTokens.total", usage_json["prompt_tokens"])
+                        callback_metric_ex(user_tag, req_appid, self.metric_channel, f"{self.metric_channel}OutTokens.total", usage_json["completion_tokens"])
 
                         channel_default = self.metric_channel + "_default"
-                        callback_metric_ex(user_tag, self.metric_appid, channel_default, "tokens.total", usage_json["total_tokens"])
-                        callback_metric_ex(user_tag, self.metric_appid, channel_default, f"{channel_default}InTokens.total", usage_json["prompt_tokens"])
-                        callback_metric_ex(user_tag, self.metric_appid, channel_default, f"{channel_default}OutTokens.total", usage_json["completion_tokens"])
-                    
+                        callback_metric_ex(user_tag, req_appid, channel_default, "tokens.total", usage_json["total_tokens"])
+                        callback_metric_ex(user_tag, req_appid, channel_default, f"{channel_default}InTokens.total", usage_json["prompt_tokens"])
+                        callback_metric_ex(user_tag, req_appid, channel_default, f"{channel_default}OutTokens.total", usage_json["completion_tokens"])
+
                     except Exception as e:
                         self.filelogger.error(f"Failed to callback_metric, err: {e}")
                     
